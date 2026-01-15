@@ -1,0 +1,5 @@
+{
+  "name": "Weibo Chat Archiver",
+  "description": "A powerful utility to back up, parse, and analyze Weibo chat histories. Use Gemini to intelligently clean raw network data into structured archives.",
+  "requestFramePermissions": []
+}
