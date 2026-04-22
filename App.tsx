@@ -6,6 +6,7 @@ import ChatHistory from './components/ChatHistory';
 import Analytics from './components/Analytics';
 import ChatViewer from './components/ChatViewer';
 import { ViewState, ChatArchive } from './types';
+import { parseRawChatData } from './services/gemini';
 import { 
   Plus, 
   History, 
@@ -43,6 +44,47 @@ const App: React.FC = () => {
     setCurrentView(ViewState.HISTORY);
   };
 
+  const syncFromServer = async () => {
+    try {
+      const response = await fetch('/api/archives');
+      if (!response.ok) throw new Error("Failed to fetch from server");
+      const serverArchives = await response.json();
+      
+      // Convert server format to ChatArchive
+      const formattedArchives: ChatArchive[] = serverArchives.map((item: any) => {
+        const { messages } = parseRawChatData(item.data);
+        const parts = item.fileName.split('_');
+        const groupId = parts[1] || "4761715839862414";
+        const dateStr = parts[2]?.split('.')[0] || new Date().toISOString().split('T')[0];
+        const senderName = messages[0]?.senderName || '未知用户';
+        
+        return {
+          id: item.fileName,
+          groupName: `${senderName} 的备份 (${dateStr})`,
+          groupUid: groupId,
+          createdAt: new Date(dateStr).toISOString(),
+          messages: messages
+        };
+      });
+
+      // Merge with server archives, preferring server data for existing IDs
+      setArchives(prev => {
+        const archiveMap = new Map(prev.map(a => [a.id, a]));
+        formattedArchives.forEach(a => {
+          archiveMap.set(a.id, a);
+        });
+        return Array.from(archiveMap.values()).sort((a, b) => 
+          new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+        );
+      });
+      
+      alert(`同步成功！从服务器加载了 ${formattedArchives.length} 个备份文件。`);
+    } catch (error) {
+      console.error("Sync failed", error);
+      alert("同步失败，请确保后端服务已启动。");
+    }
+  };
+
   const handleDelete = (id: string) => {
     if (window.confirm("确定要删除这条备份吗？此操作不可撤销。")) {
       setArchives(prev => prev.filter(a => a.id !== id));
@@ -50,7 +92,24 @@ const App: React.FC = () => {
   };
 
   const handleViewDetails = (archive: ChatArchive) => {
-    setSelectedArchive(archive);
+    // 为了实现“丝滑衔接”，我们将同一群组的所有备份消息合并
+    const groupMessages = archives
+      .filter(a => a.groupUid === archive.groupUid)
+      .flatMap(a => a.messages);
+    
+    // 去重并排序
+    const uniqueMessagesMap = new Map();
+    groupMessages.forEach(m => {
+      uniqueMessagesMap.set(m.id, m);
+    });
+    
+    const sortedMessages = Array.from(uniqueMessagesMap.values())
+      .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+
+    setSelectedArchive({
+      ...archive,
+      messages: sortedMessages
+    });
   };
 
   const totalMessages = archives.reduce((sum, a) => sum + a.messages.length, 0);
@@ -67,7 +126,7 @@ const App: React.FC = () => {
 
     switch (currentView) {
       case ViewState.IMPORT:
-        return <DataImporter onImport={handleImport} />;
+        return <DataImporter onImport={handleImport} onSyncServer={syncFromServer} />;
       case ViewState.HISTORY:
         return (
           <div className="space-y-6">

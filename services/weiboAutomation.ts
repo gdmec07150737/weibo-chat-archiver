@@ -3,60 +3,191 @@
  * 生成自动化采集脚本字符串
  * 该脚本设计在微博聊天页面控制台运行
  */
-export const generateCollectorScript = (groupId: string = '') => {
+export const generateCollectorScript = (groupId: string = '', appUrl: string = '') => {
   return `
 (async function() {
   console.log("%c微博聊天记录自动化采集器启动...", "color: #6366f1; font-weight: bold; font-size: 14px;");
   
-  const groupId = "${groupId}" || new URLSearchParams(window.location.hash.split('?')[1]).get('id');
+  const getGroupId = () => {
+    if ("${groupId}") return "${groupId}";
+    const hash = window.location.hash;
+    const hashParams = new URLSearchParams(hash.split('?')[1] || "");
+    const idFromHashParam = hashParams.get('id');
+    if (idFromHashParam) return idFromHashParam;
+    const hashNumbers = hash.match(/\\d{10,}/);
+    if (hashNumbers) return hashNumbers[0];
+    const searchId = new URLSearchParams(window.location.search).get('id');
+    if (searchId) return searchId;
+    const activeItem = document.querySelector('.chat_list .active, .chat_list .selected, [class*="active"], [class*="selected"]');
+    if (activeItem) {
+      const id = activeItem.getAttribute('data-id') || activeItem.getAttribute('uid') || activeItem.id;
+      if (id && /^\\d+$/.test(id)) return id;
+    }
+    return prompt("未能自动识别群组ID。请手动输入群组ID（可从浏览器地址栏或网络请求中获取，例如：4761715839862414）:");
+  };
+
+  const getMyUid = () => {
+    if (window.$CONFIG && window.$CONFIG.uid) return window.$CONFIG.uid;
+    const cookieUid = document.cookie.match(/wvr6_uid=(\d+)/) || document.cookie.match(/un=(\d+)/);
+    if (cookieUid) return cookieUid[1];
+    return "my_id";
+  };
+
+  const groupId = getGroupId();
+  const myUid = getMyUid();
+  const appUrl = "${appUrl}" || window.location.origin;
+
   if (!groupId) {
-    alert("未能识别群组ID，请确保你在微博聊天页面（api.weibo.com/chat/）");
+    alert("未能识别群组ID，采集取消。");
     return;
   }
 
-  let allMessages = [];
+  const mode = prompt("请选择采集模式：\\n1. 备份历史消息 (向上翻页)\\n2. 监控当前消息 (保持最新)", "1");
+  const isHistoryMode = mode === "1";
+  
+  const defaultInterval = isHistoryMode ? "2" : "20";
+  const intervalInput = prompt(\`请输入抓取间隔（秒，最小值 1）：\`, defaultInterval);
+  let interval = parseInt(intervalInput || defaultInterval) * 1000;
+  if (isNaN(interval) || interval < 1000) interval = 1000;
+
+  // 创建控制面板
+  const controlDiv = document.createElement('div');
+  controlDiv.id = "wb-collector-panel";
+  controlDiv.style = "position:fixed;top:20px;right:20px;z-index:999999;background:#1e1b4b;color:white;padding:16px;border-radius:12px;box-shadow:0 10px 25px rgba(0,0,0,0.3);font-family:sans-serif;width:240px;border:1px solid rgba(99,102,241,0.3);";
+  controlDiv.innerHTML = \`
+    <div style="font-weight:bold;margin-bottom:12px;display:flex;align-items:center;gap:8px;border-bottom:1px solid rgba(255,255,255,0.1);padding-bottom:8px;">
+      <div style="width:10px;height:10px;background:#6366f1;border-radius:50%;animation:pulse 2s infinite;"></div>
+      微博采集控制台
+    </div>
+    <div style="font-size:12px;margin-bottom:8px;opacity:0.8;">模式: \${isHistoryMode ? "历史备份" : "实时监控"}</div>
+    <div id="wb-status" style="font-size:14px;margin-bottom:12px;color:#818cf8;">正在初始化...</div>
+    <div id="wb-count" style="font-size:24px;font-weight:bold;margin-bottom:16px;text-align:center;">0 <span style="font-size:12px;font-weight:normal;opacity:0.6;">条</span></div>
+    <button id="wb-stop" style="width:100%;padding:10px;background:#ef4444;color:white;border:none;border-radius:8px;cursor:pointer;font-weight:bold;transition:all 0.2s;">停止并上传备份</button>
+    <style>
+      @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.4; } 100% { opacity: 1; } }
+      #wb-stop:hover { background: #dc2626; transform: translateY(-1px); }
+      #wb-stop:active { transform: translateY(0); }
+    </style>
+  \`;
+  document.body.appendChild(controlDiv);
+
+  let running = true;
+  document.getElementById('wb-stop').onclick = () => { 
+    running = false; 
+    document.getElementById('wb-status').innerText = "正在停止...";
+    document.getElementById('wb-stop').disabled = true;
+    document.getElementById('wb-stop').style.opacity = "0.5";
+  };
+
+  let allMessagesMap = new Map();
   let maxMid = "";
   let page = 1;
   const count = 20;
 
+  const updateUI = (status, total) => {
+    const statusEl = document.getElementById('wb-status');
+    const countEl = document.getElementById('wb-count');
+    if (statusEl) statusEl.innerText = status;
+    if (countEl) countEl.innerHTML = \`\${total} <span style="font-size:12px;font-weight:normal;opacity:0.6;">条</span>\`;
+  };
+
   try {
-    while (true) {
-      console.log(\`正在抓取第 \${page} 页...\`);
-      const url = \`https://api.weibo.com/webim/groupchat/query_messages.json?convert_emoji=1&query_sender=1&count=\${count}&id=\${groupId}\${maxMid ? "&max_mid=" + maxMid : ""}&source=209678993&t=\${Date.now()}\`;
+    while (running) {
+      updateUI(\`正在抓取第 \${page} 页...\`, allMessagesMap.size);
+      console.log(\`[采集器] 正在请求第 \${page} 页, max_mid: \${maxMid || '无'}\`);
+      
+      const url = \`https://api.weibo.com/webim/groupchat/query_messages.json?convert_emoji=1&query_sender=1&count=\${count}&id=\${groupId}\${(isHistoryMode && maxMid) ? "&max_mid=" + maxMid : ""}&source=209678993&t=\${Date.now()}\`;
       
       const response = await fetch(url);
       const data = await response.json();
       
-      if (!data.messages || data.messages.length === 0) break;
-      
-      allMessages = allMessages.concat(data.messages);
-      
-      // 获取下一页的游标
-      const lastMsg = data.messages[data.messages.length - 1];
-      maxMid = lastMsg.mid;
-      
-      page++;
-      // 稍微延迟，避免频率限制
-      await new Promise(r => setTimeout(r, 800));
-      
-      if (page > 50) { // 安全限制，防止死循环
-        if (!confirm("已抓取 50 页，是否继续？")) break;
+      if (data.error || data.error_code) {
+        console.error("[采集器] 微博接口返回错误:", data);
+        updateUI(\`接口错误: \${data.error || data.error_code}\`, allMessagesMap.size);
+        break;
       }
+
+      const messages = data.messages || [];
+      console.log(\`[采集器] 本页抓取到 \${messages.length} 条消息\`);
+
+      if (messages.length === 0) {
+        if (isHistoryMode) {
+          updateUI("已抓取全部历史记录", allMessagesMap.size);
+          break;
+        } else {
+          console.log("[采集器] 暂无新消息");
+        }
+      } else {
+        let newCount = 0;
+        messages.forEach(msg => {
+          const id = (msg.id || msg.mid || msg.idstr || "").toString();
+          const time = (msg.time || "").toString();
+          const key = \`\${id}_\${time}\`;
+          if (id && !allMessagesMap.has(key)) {
+            allMessagesMap.set(key, msg);
+            newCount++;
+          }
+        });
+
+        console.log(\`[采集器] 本页新增 \${newCount} 条唯一消息\`);
+
+        if (isHistoryMode) {
+          // 自动识别最旧的消息 ID 作为下一页的游标
+          let oldestMsg = messages[0];
+          for (let i = 1; i < messages.length; i++) {
+            const currentId = (messages[i].mid || messages[i].id || "").toString();
+            const oldestId = (oldestMsg.mid || oldestMsg.id || "").toString();
+            // 比较 ID 长度和值，ID 越小通常越旧
+            if (currentId.length < oldestId.length || (currentId.length === oldestId.length && currentId < oldestId)) {
+              oldestMsg = messages[i];
+            }
+          }
+          
+          const nextCursor = (oldestMsg.mid || oldestMsg.id || oldestMsg.idstr || "").toString();
+          console.log(\`[采集器] 下一页游标 (max_mid): \${nextCursor}\`);
+
+          if (!nextCursor || nextCursor === maxMid) {
+            console.log("[采集器] 游标未变化或无效，停止抓取");
+            if (newCount === 0) break;
+          }
+          maxMid = nextCursor;
+        }
+      }
+      
+      if (!running) break;
+      
+      console.log(\`[采集器] 等待 \${interval/1000} 秒后继续...\`);
+      await new Promise(r => setTimeout(r, interval));
+      page++;
     }
 
-    const blob = new Blob([JSON.stringify(allMessages, null, 2)], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = \`weibo_chat_\${groupId}_\${new Date().getTime()}.json\`;
-    document.body.appendChild(a);
-    a.click();
-    
-    console.log("%c抓取完成！已自动下载 JSON 文件，请将其拖入备份工具中。", "color: #10b981; font-weight: bold;");
-    alert(\`抓取完成！共计 \${allMessages.length} 条消息。请将下载的文件导入备份工具。\`);
+    const allMessages = Array.from(allMessagesMap.values());
+    if (allMessages.length === 0) {
+      alert("未抓取到任何消息，操作取消。");
+      controlDiv.remove();
+      return;
+    }
+
+    updateUI("正在上传备份...", allMessages.length);
+    const backupResponse = await fetch(\`\${appUrl}/api/backup\`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ groupId, messages: allMessages })
+    });
+
+    if (backupResponse.ok) {
+      updateUI("备份成功！", allMessages.length);
+      setTimeout(() => {
+        alert(\`备份成功！共计 \${allMessages.length} 条消息。已自动保存到服务器。\`);
+        controlDiv.remove();
+      }, 1000);
+    } else {
+      throw new Error("服务器响应错误");
+    }
   } catch (err) {
-    console.error("采集失败:", err);
-    alert("采集过程中出现错误，请检查控制台。");
+    console.error("采集或上传失败:", err);
+    alert("采集过程中出现错误，请检查控制台。确保备份工具已启动且允许跨域。");
+    controlDiv.remove();
   }
 })();
   `.trim();

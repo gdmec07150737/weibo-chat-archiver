@@ -1,21 +1,23 @@
-
 {
   "name": "weibo-chat-archiver",
   "private": true,
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
+    "dev": "npx tsx server.ts",
+    "lint": "tsc --noEmit",
     "build": "tsc && vite build",
     "preview": "vite preview"
   },
   "dependencies": {
-    "@google/genai": "^1.36.0",
+    "cors": "^2.8.6",
     "date-fns": "^4.1.0",
+    "express": "^5.2.1",
     "lucide-react": "^0.562.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "recharts": "^2.15.1",
+    "tsx": "^4.21.0",
     "uuid": "^11.0.5"
   },
   "devDependencies": {

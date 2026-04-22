@@ -6,6 +6,10 @@ export interface WeiboMessage {
   content: string;
   timestamp: string; // ISO format
   avatar?: string;
+  attachments?: {
+    type: string;
+    url: string;
+  }[];
 }
 
 export interface ChatArchive {
