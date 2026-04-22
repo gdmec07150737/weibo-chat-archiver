@@ -27,7 +27,19 @@ const DataImporter: React.FC<DataImporterProps> = ({ onImport, onSyncServer }) =
   const [isSyncing, setIsSyncing] = useState(false);
   const [copied, setCopied] = useState(false);
   
-  const appUrl = window.location.origin;
+  const getAppUrl = () => {
+    let origin = window.location.origin;
+    // 如果在预览环境中，origin 可能被识别为 localhost:3000，
+    // 但采集脚本在微博 (https) 运行，必须要用 https 地址才能避免混合内容错误。
+    if (origin.includes('localhost') && !window.location.href.includes('localhost')) {
+      // 尝试从当前 URL 恢复正确的 HTTPS 地址
+      const url = new URL(window.location.href);
+      return `https://${url.host}`;
+    }
+    return origin;
+  };
+
+  const appUrl = getAppUrl();
   const automationScript = generateCollectorScript('', appUrl);
   const bookmarklet = `javascript:${encodeURIComponent(automationScript)}`;
 

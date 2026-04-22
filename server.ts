@@ -1,7 +1,9 @@
 import express from "express";
 import { createServer as createViteServer } from "vite";
-import cors from "cors";
+import https from "node:https";
+// NOTE: cors 包已改为手动实现，确保 Express 5 + WSL2 环境下的兼容性
 import fs from "fs/promises";
+import fsSync from "node:fs";
 import path from "path";
 import { fileURLToPath } from "url";
 
@@ -12,9 +14,19 @@ async function startServer() {
   const app = express();
   const PORT = 3000;
 
-  // Middleware
-  app.use(cors());
-  app.use(express.json({ limit: '50mb' }));
+  // Manual CORS Implementation for maximum reliability in proxy environments
+  app.use((req, res, next) => {
+    res.header('Access-Control-Allow-Origin', '*');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
+    // Critical for Private Network Access (PNA) security in Chrome
+    res.header('Access-Control-Allow-Private-Network', 'true');
+    if (req.method === 'OPTIONS') {
+      return res.sendStatus(200);
+    }
+    next();
+  });
+  app.use(express.json({ limit: '100mb' }));
 
   // Ensure backups directory exists
   const backupsDir = path.join(process.cwd(), 'backups');
@@ -46,14 +58,24 @@ async function startServer() {
         let dateStr = "";
         const timeVal = msg.time || msg.created_at;
         
-        if (typeof timeVal === 'string') {
-          // Match YYYY-MM-DD
+        if (typeof timeVal === 'number') {
+          // 处理 Unix 时间戳（秒）
+          dateStr = new Date(timeVal * 1000).toISOString().split('T')[0];
+        } else if (typeof timeVal === 'string') {
+          // 处理日期字符串
           const match = timeVal.match(/^\d{4}-\d{2}-\d{2}/);
-          if (match) dateStr = match[0];
+          if (match) {
+            dateStr = match[0];
+          } else {
+            const d = new Date(timeVal);
+            if (!isNaN(d.getTime())) {
+              dateStr = d.toISOString().split('T')[0];
+            }
+          }
         }
         
         if (!dateStr) {
-          // Fallback to current date if time is missing or unparseable
+          // 兜底：如果时间缺失或无法解析，使用当前日期
           dateStr = new Date().toISOString().split('T')[0];
         }
 
@@ -72,9 +94,14 @@ async function startServer() {
         let existingMessages = [];
         try {
           const content = await fs.readFile(filePath, 'utf-8');
-          existingMessages = JSON.parse(content);
+          const parsed = JSON.parse(content);
+          if (Array.isArray(parsed)) {
+            existingMessages = parsed;
+          } else {
+            console.warn(`File ${fileName} content is not an array, resetting.`);
+          }
         } catch (e) {
-          // File doesn't exist yet
+          // File doesn't exist or is empty
         }
 
         // Merge and deduplicate by ID
@@ -91,9 +118,13 @@ async function startServer() {
 
         const mergedMessages = Array.from(messageMap.values())
           .sort((a, b) => {
-            const timeA = new Date(a.time || a.created_at).getTime();
-            const timeB = new Date(b.time || b.created_at).getTime();
-            return timeA - timeB;
+            const getTs = (m: any) => {
+              const val = m.time || m.created_at;
+              if (typeof val === 'number') return val * 1000;
+              const d = new Date(val);
+              return isNaN(d.getTime()) ? 0 : d.getTime();
+            };
+            return getTs(a) - getTs(b);
           });
 
         await fs.writeFile(filePath, JSON.stringify(mergedMessages, null, 2));
@@ -131,7 +162,13 @@ async function startServer() {
   // Vite middleware for development
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        // WSL2 环境下需要显式配置 HMR，否则可能导致连接异常
+        hmr: {
+          host: 'localhost',
+        },
+      },
       appType: "spa",
     });
     app.use(vite.middlewares);
@@ -143,9 +180,18 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on http://localhost:${PORT}`);
+ // NOTE: 使用 HTTPS 服务器以避免浏览器 Mixed Content 策略阻止请求
+  const httpsOptions = {
+    key: fsSync.readFileSync(path.join(process.cwd(), 'localhost+2-key.pem')),
+    cert: fsSync.readFileSync(path.join(process.cwd(), 'localhost+2.pem')),
+  };
+
+  https.createServer(httpsOptions, app).listen(PORT, "0.0.0.0", () => {
+    console.log(`Server running on https://localhost:${PORT}`);
   });
 }
 
-startServer();
+startServer().catch((err) => {
+  console.error('服务器启动失败:', err);
+  process.exit(1);
+});

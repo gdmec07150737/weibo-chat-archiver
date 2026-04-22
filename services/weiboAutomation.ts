@@ -168,25 +168,82 @@ export const generateCollectorScript = (groupId: string = '', appUrl: string = '
       return;
     }
 
-    updateUI("正在上传备份...", allMessages.length);
-    const backupResponse = await fetch(\`\${appUrl}/api/backup\`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ groupId, messages: allMessages })
-    });
+    // 按日期分组消息（使用东八区时间）
+    const groupByDate = (msgs) => {
+      const groups = {};
+      msgs.forEach(msg => {
+        const t = msg.time || msg.created_at;
+        let dateStr = "";
+        if (typeof t === "number" && t > 1000000000) {
+          const d = new Date(t * 1000);
+          dateStr = d.toLocaleDateString("sv-SE", { timeZone: "Asia/Shanghai" });
+        } else if (typeof t === "string") {
+          const m = t.match(/^\\d{4}-\\d{2}-\\d{2}/);
+          if (m) dateStr = m[0];
+        }
+        if (!dateStr) dateStr = new Date().toLocaleDateString("sv-SE", { timeZone: "Asia/Shanghai" });
+        if (!groups[dateStr]) groups[dateStr] = [];
+        groups[dateStr].push(msg);
+      });
+      return groups;
+    };
 
-    if (backupResponse.ok) {
-      updateUI("备份成功！", allMessages.length);
+    // 下载 JSON 文件到本地
+    const downloadJson = (data, fileName) => {
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = fileName;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    };
+
+    updateUI("正在保存备份...", allMessages.length);
+
+    // 先尝试 POST 到本地服务器（同源环境下会成功）
+    let serverSuccess = false;
+    try {
+      const backupResponse = await fetch(\`\${appUrl}/api/backup\`, {
+        method: 'POST',
+        mode: 'cors',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ groupId, messages: allMessages })
+      });
+      if (backupResponse.ok) {
+        serverSuccess = true;
+        const result = await backupResponse.json();
+        updateUI("备份成功！", allMessages.length);
+        console.log("[采集器] 服务器保存成功:", result);
+        setTimeout(() => {
+          alert(\`备份成功！共计 \${allMessages.length} 条消息。\\n保存的文件: \${(result.files || []).join(", ")}\`);
+          controlDiv.remove();
+        }, 1000);
+      }
+    } catch (uploadErr) {
+      console.warn("[采集器] 服务器上传失败（Mixed Content / CORS），降级为本地下载:", uploadErr.message);
+    }
+
+    // 上传失败时，降级为按日期分组下载 JSON 文件
+    if (!serverSuccess) {
+      updateUI("正在下载备份文件...", allMessages.length);
+      const dateGroups = groupByDate(allMessages);
+      const fileNames = [];
+      for (const [date, msgs] of Object.entries(dateGroups)) {
+        const fileName = \`weibo_\${groupId}_\${date}.json\`;
+        downloadJson(msgs, fileName);
+        fileNames.push(\`\${fileName} (\${msgs.length}条)\`);
+      }
       setTimeout(() => {
-        alert(\`备份成功！共计 \${allMessages.length} 条消息。已自动保存到服务器。\`);
+        alert(\`已下载 \${Object.keys(dateGroups).length} 个备份文件（按日期分组）：\\n\${fileNames.join("\\n")}\\n\\n请在备份工具中使用「载入 JSON 文件」导入。\`);
         controlDiv.remove();
       }, 1000);
-    } else {
-      throw new Error("服务器响应错误");
     }
   } catch (err) {
-    console.error("采集或上传失败:", err);
-    alert("采集过程中出现错误，请检查控制台。确保备份工具已启动且允许跨域。");
+    console.error("[采集器] 采集失败:", err);
+    alert(\`采集过程中出现错误：\${err.message || String(err)}\`);
     controlDiv.remove();
   }
 })();
