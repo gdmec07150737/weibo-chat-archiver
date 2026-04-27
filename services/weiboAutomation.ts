@@ -23,7 +23,7 @@ export const generateCollectorScript = (groupId: string = '', appUrl: string = '
       const id = activeItem.getAttribute('data-id') || activeItem.getAttribute('uid') || activeItem.id;
       if (id && /^\\d+$/.test(id)) return id;
     }
-    return prompt("未能自动识别群组ID。请手动输入群组ID（可从浏览器地址栏或网络请求中获取，例如：4761715839862414）:");
+    return prompt("未能自动识别群组ID。请手动输入群组ID（可从浏览器地址栏或网络请求中获取，例如：8888）:");
   };
 
   const getMyUid = () => {
