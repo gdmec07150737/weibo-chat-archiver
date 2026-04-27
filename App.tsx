@@ -78,7 +78,7 @@ const App: React.FC = () => {
         );
       });
       
-      alert(`同步成功！从服务器加载了 ${formattedArchives.length} 个备份文件。`);
+      alert(`同步成功！从 ./backups 加载了 ${formattedArchives.length} 个备份文件。`);
     } catch (error) {
       console.error("Sync failed", error);
       alert("同步失败，请确保后端服务已启动。");

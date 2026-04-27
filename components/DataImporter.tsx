@@ -29,7 +29,7 @@ const DataImporter: React.FC<DataImporterProps> = ({ onImport, onSyncServer }) =
   
   const getAppUrl = () => {
     let origin = window.location.origin;
-    // 如果在预览环境中，origin 可能被识别为 localhost:3000，
+    // 如果在预览环境中，origin 可能被识别为 localhost:5173，
     // 但采集脚本在微博 (https) 运行，必须要用 https 地址才能避免混合内容错误。
     if (origin.includes('localhost') && !window.location.href.includes('localhost')) {
       // 尝试从当前 URL 恢复正确的 HTTPS 地址
@@ -125,7 +125,7 @@ const DataImporter: React.FC<DataImporterProps> = ({ onImport, onSyncServer }) =
               {[
                 "将下方的 [一键采集] 按钮拖动到您的浏览器书签栏",
                 "在微博聊天页面点击该书签",
-                "数据将自动采集并保存到服务器根目录"
+                "数据将自动采集并保存到本地目录 ./backups"
               ].map((text, i) => (
                 <div key={i} className="flex items-center gap-4 text-sm font-medium text-indigo-100/70">
                   <div className="w-6 h-6 rounded-full bg-indigo-500/20 flex items-center justify-center text-xs text-indigo-400 border border-indigo-500/30 font-bold">{i+1}</div>
@@ -142,7 +142,7 @@ const DataImporter: React.FC<DataImporterProps> = ({ onImport, onSyncServer }) =
                 className="px-6 py-3 bg-indigo-500/20 border border-indigo-500/30 text-indigo-100 rounded-xl font-bold hover:bg-indigo-500/40 transition-all flex items-center gap-2"
               >
                 {isSyncing ? <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" /> : <Save className="w-4 h-4" />}
-                从服务器同步备份
+                从 ./backups 目录同步备份
               </button>
             </div>
           </div>

@@ -12,7 +12,7 @@ const __dirname = path.dirname(__filename);
 
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const PORT = 5173;
 
   // Manual CORS Implementation for maximum reliability in proxy environments
   app.use((req, res, next) => {
