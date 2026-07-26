@@ -1,4 +1,3 @@
-
 /**
  * 生成自动化采集脚本字符串
  * 该脚本设计在微博聊天页面控制台运行
@@ -28,7 +27,7 @@ export const generateCollectorScript = (groupId: string = '', appUrl: string = '
 
   const getMyUid = () => {
     if (window.$CONFIG && window.$CONFIG.uid) return window.$CONFIG.uid;
-    const cookieUid = document.cookie.match(/wvr6_uid=(\d+)/) || document.cookie.match(/un=(\d+)/);
+    const cookieUid = document.cookie.match(/wvr6_uid=(\\d+)/) || document.cookie.match(/un=(\\d+)/);
     if (cookieUid) return cookieUid[1];
     return "my_id";
   };
@@ -53,16 +52,17 @@ export const generateCollectorScript = (groupId: string = '', appUrl: string = '
   // 创建控制面板
   const controlDiv = document.createElement('div');
   controlDiv.id = "wb-collector-panel";
-  controlDiv.style = "position:fixed;top:20px;right:20px;z-index:999999;background:#1e1b4b;color:white;padding:16px;border-radius:12px;box-shadow:0 10px 25px rgba(0,0,0,0.3);font-family:sans-serif;width:240px;border:1px solid rgba(99,102,241,0.3);";
+  controlDiv.style = "position:fixed;top:20px;right:20px;z-index:999999;background:#1e1b4b;color:white;padding:16px;border-radius:12px;box-shadow:0 10px 25px rgba(0,0,0,0.3);font-family:sans-serif;width:260px;border:1px solid rgba(99,102,241,0.3);";
   controlDiv.innerHTML = \`
     <div style="font-weight:bold;margin-bottom:12px;display:flex;align-items:center;gap:8px;border-bottom:1px solid rgba(255,255,255,0.1);padding-bottom:8px;">
       <div style="width:10px;height:10px;background:#6366f1;border-radius:50%;animation:pulse 2s infinite;"></div>
       微博采集控制台
     </div>
-    <div style="font-size:12px;margin-bottom:8px;opacity:0.8;">模式: \${isHistoryMode ? "历史备份" : "实时监控"}</div>
-    <div id="wb-status" style="font-size:14px;margin-bottom:12px;color:#818cf8;">正在初始化...</div>
-    <div id="wb-count" style="font-size:24px;font-weight:bold;margin-bottom:16px;text-align:center;">0 <span style="font-size:12px;font-weight:normal;opacity:0.6;">条</span></div>
-    <button id="wb-stop" style="width:100%;padding:10px;background:#ef4444;color:white;border:none;border-radius:8px;cursor:pointer;font-weight:bold;transition:all 0.2s;">停止并上传备份</button>
+    <div style="font-size:12px;margin-bottom:8px;opacity:0.8;">模式: \${isHistoryMode ? "历史备份（逐页入库）" : "实时监控（逐页入库）"}</div>
+    <div id="wb-status" style="font-size:14px;margin-bottom:8px;color:#818cf8;">正在初始化...</div>
+    <div id="wb-count" style="font-size:22px;font-weight:bold;margin-bottom:4px;text-align:center;">0 <span style="font-size:12px;font-weight:normal;opacity:0.6;">已入库</span></div>
+    <div id="wb-pending" style="font-size:12px;text-align:center;margin-bottom:16px;opacity:0.7;">待重试 0 条</div>
+    <button id="wb-stop" style="width:100%;padding:10px;background:#ef4444;color:white;border:none;border-radius:8px;cursor:pointer;font-weight:bold;transition:all 0.2s;">停止采集</button>
     <style>
       @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.4; } 100% { opacity: 1; } }
       #wb-stop:hover { background: #dc2626; transform: translateY(-1px); }
@@ -79,21 +79,113 @@ export const generateCollectorScript = (groupId: string = '', appUrl: string = '
     document.getElementById('wb-stop').style.opacity = "0.5";
   };
 
-  let allMessagesMap = new Map();
+  // 仅保留去重 key，成功入库后立即丢弃消息正文，降低内存占用
+  const seenKeys = new Set();
+  const pendingMessages = [];
+  let uploadedCount = 0;
+  let sessionSeenCount = 0;
   let maxMid = "";
   let page = 1;
   const count = 20;
 
-  const updateUI = (status, total) => {
+  const updateUI = (status) => {
     const statusEl = document.getElementById('wb-status');
     const countEl = document.getElementById('wb-count');
+    const pendingEl = document.getElementById('wb-pending');
     if (statusEl) statusEl.innerText = status;
-    if (countEl) countEl.innerHTML = \`\${total} <span style="font-size:12px;font-weight:normal;opacity:0.6;">条</span>\`;
+    if (countEl) {
+      countEl.innerHTML = \`\${uploadedCount} <span style="font-size:12px;font-weight:normal;opacity:0.6;">已入库</span>\`;
+    }
+    if (pendingEl) {
+      pendingEl.innerText = pendingMessages.length
+        ? \`待重试 \${pendingMessages.length} 条 · 本轮见到 \${sessionSeenCount} 条\`
+        : \`本轮见到 \${sessionSeenCount} 条\`;
+    }
   };
+
+  const flushToServer = async (msgs, label) => {
+    if (!msgs.length) return true;
+    updateUI(\`正在写入 MySQL（\${label}，\${msgs.length} 条）...\`);
+    try {
+      const backupResponse = await fetch(\`\${appUrl}/api/backup\`, {
+        method: 'POST',
+        mode: 'cors',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ groupId, messages: msgs, myUid })
+      });
+      if (backupResponse.ok) {
+        const result = await backupResponse.json();
+        uploadedCount += msgs.length;
+        console.log(\`[采集器] 实时入库成功 (\${label}):\`, result);
+        return true;
+      }
+      console.warn("[采集器] 实时入库 HTTP 失败:", backupResponse.status, await backupResponse.text());
+      return false;
+    } catch (uploadErr) {
+      console.warn("[采集器] 实时入库失败:", uploadErr.message || uploadErr);
+      return false;
+    }
+  };
+
+  // 按日期分组消息（使用东八区时间）
+  const groupByDate = (msgs) => {
+    const groups = {};
+    msgs.forEach(msg => {
+      const t = msg.time || msg.created_at;
+      let dateStr = "";
+      if (typeof t === "number" && t > 1000000000) {
+        const d = new Date(t * 1000);
+        dateStr = d.toLocaleDateString("sv-SE", { timeZone: "Asia/Shanghai" });
+      } else if (typeof t === "string") {
+        const m = t.match(/^\\d{4}-\\d{2}-\\d{2}/);
+        if (m) dateStr = m[0];
+      }
+      if (!dateStr) dateStr = new Date().toLocaleDateString("sv-SE", { timeZone: "Asia/Shanghai" });
+      if (!groups[dateStr]) groups[dateStr] = [];
+      groups[dateStr].push(msg);
+    });
+    return groups;
+  };
+
+  const downloadJson = (data, fileName) => {
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = fileName;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  // 历史模式：若 MySQL 已有数据，可从最旧消息继续往更早翻页
+  if (isHistoryMode) {
+    try {
+      updateUI("正在检查 MySQL 进度...");
+      const progressRes = await fetch(\`\${appUrl}/api/progress?groupId=\${encodeURIComponent(groupId)}\`, { mode: 'cors' });
+      if (progressRes.ok) {
+        const progress = await progressRes.json();
+        if (progress.count > 0 && progress.oldestMessageId) {
+          const resume = confirm(
+            \`检测到该群在 MySQL 已有 \${progress.count} 条消息。\\n\\n是否从最旧消息继续往更早抓取（断点续采）？\\n\\n点击「确定」续采；「取消」则从头开始。\`
+          );
+          if (resume) {
+            maxMid = String(progress.oldestMessageId);
+            uploadedCount = Number(progress.count) || 0;
+            console.log(\`[采集器] 断点续采，从 max_mid=\${maxMid} 继续，库中已有 \${uploadedCount} 条\`);
+            updateUI(\`断点续采：从已有 \${uploadedCount} 条继续\`);
+          }
+        }
+      }
+    } catch (progressErr) {
+      console.warn("[采集器] 读取进度失败，将从头抓取:", progressErr.message || progressErr);
+    }
+  }
 
   try {
     while (running) {
-      updateUI(\`正在抓取第 \${page} 页...\`, allMessagesMap.size);
+      updateUI(\`正在抓取第 \${page} 页...\`);
       console.log(\`[采集器] 正在请求第 \${page} 页, max_mid: \${maxMid || '无'}\`);
       
       const url = \`https://api.weibo.com/webim/groupchat/query_messages.json?convert_emoji=1&query_sender=1&count=\${count}&id=\${groupId}\${(isHistoryMode && maxMid) ? "&max_mid=" + maxMid : ""}&source=209678993&t=\${Date.now()}\`;
@@ -103,7 +195,7 @@ export const generateCollectorScript = (groupId: string = '', appUrl: string = '
       
       if (data.error || data.error_code) {
         console.error("[采集器] 微博接口返回错误:", data);
-        updateUI(\`接口错误: \${data.error || data.error_code}\`, allMessagesMap.size);
+        updateUI(\`接口错误: \${data.error || data.error_code}\`);
         break;
       }
 
@@ -112,24 +204,35 @@ export const generateCollectorScript = (groupId: string = '', appUrl: string = '
 
       if (messages.length === 0) {
         if (isHistoryMode) {
-          updateUI("已抓取全部历史记录", allMessagesMap.size);
+          updateUI("已抓取全部历史记录");
           break;
         } else {
           console.log("[采集器] 暂无新消息");
         }
       } else {
-        let newCount = 0;
+        const pageNew = [];
         messages.forEach(msg => {
           const id = (msg.id || msg.mid || msg.idstr || "").toString();
           const time = (msg.time || "").toString();
           const key = \`\${id}_\${time}\`;
-          if (id && !allMessagesMap.has(key)) {
-            allMessagesMap.set(key, msg);
-            newCount++;
+          if (id && !seenKeys.has(key)) {
+            seenKeys.add(key);
+            pageNew.push(msg);
+            sessionSeenCount++;
           }
         });
 
-        console.log(\`[采集器] 本页新增 \${newCount} 条唯一消息\`);
+        console.log(\`[采集器] 本页新增 \${pageNew.length} 条唯一消息\`);
+
+        // 每页立刻写入 MySQL；成功后不保留正文，只留去重 key
+        if (pageNew.length > 0) {
+          const ok = await flushToServer(pageNew, \`第 \${page} 页\`);
+          if (!ok) {
+            pendingMessages.push(...pageNew);
+            console.warn(\`[采集器] 第 \${page} 页入库失败，已加入待重试队列（\${pendingMessages.length} 条）\`);
+          }
+          updateUI(ok ? \`第 \${page} 页已入库\` : \`第 \${page} 页入库失败，已排队重试\`);
+        }
 
         if (isHistoryMode) {
           // 自动识别最旧的消息 ID 作为下一页的游标
@@ -148,7 +251,7 @@ export const generateCollectorScript = (groupId: string = '', appUrl: string = '
 
           if (!nextCursor || nextCursor === maxMid) {
             console.log("[采集器] 游标未变化或无效，停止抓取");
-            if (newCount === 0) break;
+            if (pageNew.length === 0) break;
           }
           maxMid = nextCursor;
         }
@@ -161,89 +264,56 @@ export const generateCollectorScript = (groupId: string = '', appUrl: string = '
       page++;
     }
 
-    const allMessages = Array.from(allMessagesMap.values());
-    if (allMessages.length === 0) {
+    // 停止/结束后：重试待入库消息
+    if (pendingMessages.length > 0) {
+      updateUI(\`正在重试入库 \${pendingMessages.length} 条...\`);
+      const retryBatch = pendingMessages.splice(0, pendingMessages.length);
+      const ok = await flushToServer(retryBatch, "待重试");
+      if (!ok) {
+        pendingMessages.push(...retryBatch);
+      }
+    }
+
+    if (uploadedCount === 0 && pendingMessages.length === 0) {
       alert("未抓取到任何消息，操作取消。");
       controlDiv.remove();
       return;
     }
 
-    // 按日期分组消息（使用东八区时间）
-    const groupByDate = (msgs) => {
-      const groups = {};
-      msgs.forEach(msg => {
-        const t = msg.time || msg.created_at;
-        let dateStr = "";
-        if (typeof t === "number" && t > 1000000000) {
-          const d = new Date(t * 1000);
-          dateStr = d.toLocaleDateString("sv-SE", { timeZone: "Asia/Shanghai" });
-        } else if (typeof t === "string") {
-          const m = t.match(/^\\d{4}-\\d{2}-\\d{2}/);
-          if (m) dateStr = m[0];
-        }
-        if (!dateStr) dateStr = new Date().toLocaleDateString("sv-SE", { timeZone: "Asia/Shanghai" });
-        if (!groups[dateStr]) groups[dateStr] = [];
-        groups[dateStr].push(msg);
-      });
-      return groups;
-    };
-
-    // 下载 JSON 文件到本地
-    const downloadJson = (data, fileName) => {
-      const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = fileName;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
-    };
-
-    updateUI("正在保存备份...", allMessages.length);
-
-    // 先尝试 POST 到本地服务器（同源环境下会成功）
-    let serverSuccess = false;
-    try {
-      const backupResponse = await fetch(\`\${appUrl}/api/backup\`, {
-        method: 'POST',
-        mode: 'cors',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ groupId, messages: allMessages })
-      });
-      if (backupResponse.ok) {
-        serverSuccess = true;
-        const result = await backupResponse.json();
-        updateUI("备份成功！", allMessages.length);
-        console.log("[采集器] 服务器保存成功:", result);
-        setTimeout(() => {
-          alert(\`备份成功！共计 \${allMessages.length} 条消息。\\n保存的文件: \${(result.files || []).join(", ")}\`);
-          controlDiv.remove();
-        }, 1000);
-      }
-    } catch (uploadErr) {
-      console.warn("[采集器] 服务器上传失败（Mixed Content / CORS），降级为本地下载:", uploadErr.message);
-    }
-
-    // 上传失败时，降级为按日期分组下载 JSON 文件
-    if (!serverSuccess) {
-      updateUI("正在下载备份文件...", allMessages.length);
-      const dateGroups = groupByDate(allMessages);
-      const fileNames = [];
-      for (const [date, msgs] of Object.entries(dateGroups)) {
-        const fileName = \`weibo_\${groupId}_\${date}.json\`;
-        downloadJson(msgs, fileName);
-        fileNames.push(\`\${fileName} (\${msgs.length}条)\`);
-      }
+    if (pendingMessages.length === 0) {
+      updateUI("全部已写入 MySQL");
       setTimeout(() => {
-        alert(\`已下载 \${Object.keys(dateGroups).length} 个备份文件（按日期分组）：\\n\${fileNames.join("\\n")}\\n\\n请在备份工具中使用「载入 JSON 文件」导入。\`);
+        alert(\`采集完成！\\n本轮见到 \${sessionSeenCount} 条\\n累计已入库约 \${uploadedCount} 条（含此前断点）\\n\\n中途挂掉也不怕：已写入的数据都在 MySQL，下次可断点续采。\`);
         controlDiv.remove();
-      }, 1000);
+      }, 500);
+      return;
     }
+
+    // 仍有失败：降级下载未入库部分，避免丢失
+    updateUI(\`入库未完全成功，正在下载剩余 \${pendingMessages.length} 条...\`);
+    const dateGroups = groupByDate(pendingMessages);
+    const fileNames = [];
+    for (const [date, msgs] of Object.entries(dateGroups)) {
+      const fileName = \`weibo_\${groupId}_\${date}_pending.json\`;
+      downloadJson(msgs, fileName);
+      fileNames.push(\`\${fileName} (\${msgs.length}条)\`);
+    }
+    setTimeout(() => {
+      alert(\`部分消息未能写入 MySQL。\\n已入库约 \${uploadedCount} 条；剩余 \${pendingMessages.length} 条已下载：\\n\${fileNames.join("\\n")}\\n\\n请用「载入 JSON 文件」导入，或修复网络后重新运行（upsert 幂等）。\`);
+      controlDiv.remove();
+    }, 500);
   } catch (err) {
     console.error("[采集器] 采集失败:", err);
-    alert(\`采集过程中出现错误：\${err.message || String(err)}\`);
+    // 异常时尽量保住待入库数据
+    if (pendingMessages.length > 0) {
+      try {
+        const dateGroups = groupByDate(pendingMessages);
+        for (const [date, msgs] of Object.entries(dateGroups)) {
+          downloadJson(msgs, \`weibo_\${groupId}_\${date}_pending.json\`);
+        }
+      } catch (_) {}
+    }
+    alert(\`采集过程中出现错误：\${err.message || String(err)}\\n已入库约 \${uploadedCount} 条；未入库 \${pendingMessages.length} 条已尝试本地下载。\`);
     controlDiv.remove();
   }
 })();
