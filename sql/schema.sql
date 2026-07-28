@@ -26,3 +26,18 @@ CREATE TABLE IF NOT EXISTS chat_messages (
 
 -- 旧版按日 JSON 表已废弃；服务启动时会自动迁移到 chat_messages 后删除
 -- DROP TABLE IF EXISTS chat_archives;
+
+-- 群成员/发言用户（入库消息时自动 upsert）
+CREATE TABLE IF NOT EXISTS users (
+  id            INT UNSIGNED     NOT NULL AUTO_INCREMENT COMMENT '主键ID',
+  sender_id     BIGINT UNSIGNED  NOT NULL DEFAULT 0 COMMENT '用户id',
+  screen_name   VARCHAR(255)     NULL COMMENT '昵称',
+  avatar_url    VARCHAR(512)     NULL COMMENT '头像',
+  message_count INT UNSIGNED     NOT NULL DEFAULT 0 COMMENT '累计入库消息数',
+  first_seen_at DATETIME         NULL,
+  last_seen_at  DATETIME         NULL,
+  created_at    DATETIME         NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at    DATETIME         NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uk_sender_id (sender_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

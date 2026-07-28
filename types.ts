@@ -29,6 +29,14 @@ export interface ChatDayStat {
   count: number;
 }
 
+export interface ChatUserSummary {
+  senderId: string;
+  screenName: string;
+  avatarUrl: string | null;
+  messageCount: number;
+  profileUrl: string;
+}
+
 export interface MessagePage {
   groupId: string;
   items: WeiboMessage[];

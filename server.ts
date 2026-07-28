@@ -5,11 +5,14 @@ import {
   getOverallStats,
   listArchives,
   listGroupDays,
+  listGroupUsers,
   listGroups,
   listMessagesByGroup,
   queryMessagesPage,
   searchMessages,
   upsertMessages,
+  upsertUsersFromMessages,
+  fillUserAvatarFromMessages,
 } from "./db";
 import express from "express";
 import { createServer as createViteServer } from "vite";
@@ -17,6 +20,7 @@ import https from "node:https";
 import fsSync from "node:fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import { isAllowedProxyTarget } from "./services/imageProxy";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -40,6 +44,56 @@ async function startServer() {
   });
   app.use(express.json({ limit: "100mb" }));
 
+  // 微博头像/图片防盗链代理：浏览器直链 sinaimg 会 403
+  app.get("/api/img-proxy", async (req, res) => {
+    try {
+      const raw = typeof req.query.url === "string" ? req.query.url : "";
+      if (!raw) return res.status(400).send("Missing url");
+
+      let target: URL;
+      try {
+        target = new URL(raw);
+      } catch {
+        return res.status(400).send("Invalid url");
+      }
+
+      if (!isAllowedProxyTarget(target.toString())) {
+        return res.status(403).send("Host not allowed");
+      }
+
+      const upstream = await fetch(target.toString(), {
+        headers: {
+          Referer: "https://weibo.com/",
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+          Accept: "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+        },
+        redirect: "follow",
+      });
+
+      if (!upstream.ok) {
+        console.warn(
+          `img-proxy upstream ${upstream.status} for ${target.hostname}`
+        );
+        return res.status(upstream.status).send(`Upstream ${upstream.status}`);
+      }
+
+      const contentType = upstream.headers.get("content-type") || "image/jpeg";
+      if (!contentType.startsWith("image/") && !contentType.includes("octet-stream")) {
+        return res.status(502).send("Not an image");
+      }
+
+      const buf = Buffer.from(await upstream.arrayBuffer());
+      res.setHeader("Content-Type", contentType);
+      res.setHeader("Cache-Control", "public, max-age=86400");
+      res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
+      return res.send(buf);
+    } catch (error) {
+      console.error("img-proxy failed:", error);
+      return res.status(502).send("Proxy failed");
+    }
+  });
+
   try {
     await ensureSchema();
     console.log("MySQL schema ready (weibo_group_chat.chat_messages)");
@@ -53,6 +107,13 @@ async function startServer() {
       const { groupId, messages, myUid } = req.body;
       if (!groupId || !messages || !Array.isArray(messages)) {
         return res.status(400).json({ error: "Missing groupId or messages" });
+      }
+
+      // 先用原始消息写 users（避免 my_id 覆盖导致自己丢 uid）
+      try {
+        await upsertUsersFromMessages(messages);
+      } catch (e) {
+        console.warn("upsert users (pre-normalize) failed:", e);
       }
 
       const normalized = messages.map((msg: any) => {
@@ -137,14 +198,52 @@ async function startServer() {
 
       const q = typeof req.query.q === "string" ? req.query.q : "";
       const sender = typeof req.query.sender === "string" ? req.query.sender : "";
+      const senderId =
+        typeof req.query.senderId === "string" ? req.query.senderId : "";
       const cursor = typeof req.query.cursor === "string" ? req.query.cursor : null;
       const limit = Number(req.query.limit || 30);
 
-      const page = await searchMessages({ groupId, q, sender, cursor, limit });
+      const page = await searchMessages({
+        groupId,
+        q,
+        sender,
+        senderId,
+        cursor,
+        limit,
+      });
       res.json(page);
     } catch (error) {
       console.error("Failed to search messages:", error);
       res.status(500).json({ error: "Failed to search messages" });
+    }
+  });
+
+  app.get("/api/groups/:groupId/users", async (req, res) => {
+    try {
+      const groupId = String(req.params.groupId || "");
+      if (!groupId) return res.status(400).json({ error: "Missing groupId" });
+      const q = typeof req.query.q === "string" ? req.query.q : "";
+      const users = await listGroupUsers(groupId, q || undefined);
+      res.json({ groupId, users });
+    } catch (error) {
+      console.error("Failed to list group users:", error);
+      res.status(500).json({ error: "Failed to list group users" });
+    }
+  });
+
+  app.post("/api/groups/:groupId/users/:senderId/avatar", async (req, res) => {
+    try {
+      const groupId = String(req.params.groupId || "");
+      const senderId = String(req.params.senderId || "");
+      if (!groupId || !senderId) {
+        return res.status(400).json({ error: "Missing groupId or senderId" });
+      }
+      const user = await fillUserAvatarFromMessages(groupId, senderId);
+      if (!user) return res.status(404).json({ error: "User not found" });
+      res.json({ groupId, user });
+    } catch (error) {
+      console.error("Failed to fill user avatar:", error);
+      res.status(500).json({ error: "Failed to fill user avatar" });
     }
   });
 
