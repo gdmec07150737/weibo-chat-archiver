@@ -9,6 +9,7 @@ import type {
   OverallStats,
   SearchPage,
   WeiboMessage,
+  ChatUserSummary,
 } from "./types";
 
 dotenv.config();
@@ -93,6 +94,23 @@ function getSenderName(msg: any): string | null {
   const user = msg?.from_user || msg?.user || {};
   const name = user?.screen_name || user?.name || msg?.senderName || "";
   return name ? String(name) : null;
+}
+
+function getAvatarUrl(msg: any): string | null {
+  const user = msg?.from_user || msg?.user || {};
+  let url =
+    user?.avatar_hd ||
+    user?.avatar_large ||
+    user?.profile_image_url ||
+    msg?.avatar ||
+    "";
+  if (!url) return null;
+  url = String(url).split("?")[0].replace(/^http:/, "https:");
+  return url || null;
+}
+
+function isNumericSenderId(id: string | null | undefined): boolean {
+  return !!id && /^\d+$/.test(id) && id !== "0";
 }
 
 function getContent(msg: any): string | null {
@@ -197,7 +215,163 @@ export async function ensureSchema(): Promise<void> {
   `);
 
   await migrateFromLegacyArchives(db);
+  await ensureUsersSchema(db);
   await repairMsgTimeTimezone(db);
+  await backfillUsersFromMessages(db);
+}
+
+async function ensureUsersSchema(db: mysql.Pool): Promise<void> {
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id            INT UNSIGNED     NOT NULL AUTO_INCREMENT,
+      sender_id     BIGINT UNSIGNED  NOT NULL DEFAULT 0,
+      screen_name   VARCHAR(255)     NULL,
+      avatar_url    VARCHAR(512)     NULL,
+      message_count INT UNSIGNED     NOT NULL DEFAULT 0,
+      first_seen_at DATETIME         NULL,
+      last_seen_at  DATETIME         NULL,
+      created_at    DATETIME         NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at    DATETIME         NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      UNIQUE KEY uk_sender_id (sender_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+
+  // 兼容用户已建的精简表：补齐字段与唯一索引
+  const alterStatements = [
+    `ALTER TABLE users ADD COLUMN screen_name VARCHAR(255) NULL`,
+    `ALTER TABLE users ADD COLUMN avatar_url VARCHAR(512) NULL`,
+    `ALTER TABLE users ADD COLUMN message_count INT UNSIGNED NOT NULL DEFAULT 0`,
+    `ALTER TABLE users ADD COLUMN first_seen_at DATETIME NULL`,
+    `ALTER TABLE users ADD COLUMN last_seen_at DATETIME NULL`,
+    `ALTER TABLE users ADD COLUMN created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP`,
+    `ALTER TABLE users ADD COLUMN updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP`,
+  ];
+  for (const sql of alterStatements) {
+    try {
+      await db.query(sql);
+    } catch (e: any) {
+      // Duplicate column name → already exists
+      if (e?.code !== "ER_DUP_FIELDNAME" && e?.errno !== 1060) {
+        // ignore other benign errors for existing schemas
+      }
+    }
+  }
+
+  try {
+    await db.query(`ALTER TABLE users ADD UNIQUE KEY uk_sender_id (sender_id)`);
+  } catch {
+    // unique already exists
+  }
+}
+
+async function backfillUsersFromMessages(db: mysql.Pool): Promise<void> {
+  const [[userCnt]] = await db.query<mysql.RowDataPacket[]>(
+    `SELECT COUNT(*) AS c FROM users`
+  );
+  const [[senderCnt]] = await db.query<mysql.RowDataPacket[]>(
+    `SELECT COUNT(DISTINCT sender_id) AS c
+     FROM chat_messages
+     WHERE sender_id REGEXP '^[0-9]+$' AND sender_id <> '0'`
+  );
+  const users = Number(userCnt?.c || 0);
+  const senders = Number(senderCnt?.c || 0);
+  // 已基本同步则跳过，避免每次启动对大表做重聚合
+  if (senders > 0 && users >= senders * 0.95) return;
+
+  const [result] = await db.query<mysql.ResultSetHeader>(
+    `INSERT INTO users (sender_id, screen_name, message_count, first_seen_at, last_seen_at)
+     SELECT
+       CAST(sender_id AS UNSIGNED) AS sender_id,
+       MAX(NULLIF(sender_name, '')) AS screen_name,
+       COUNT(*) AS message_count,
+       FROM_UNIXTIME(MIN(msg_time_unix)) AS first_seen_at,
+       FROM_UNIXTIME(MAX(msg_time_unix)) AS last_seen_at
+     FROM chat_messages
+     WHERE sender_id REGEXP '^[0-9]+$'
+       AND sender_id <> '0'
+     GROUP BY CAST(sender_id AS UNSIGNED)
+     ON DUPLICATE KEY UPDATE
+       screen_name = COALESCE(VALUES(screen_name), users.screen_name),
+       message_count = GREATEST(users.message_count, VALUES(message_count)),
+       first_seen_at = LEAST(
+         COALESCE(users.first_seen_at, VALUES(first_seen_at)),
+         COALESCE(VALUES(first_seen_at), users.first_seen_at)
+       ),
+       last_seen_at = GREATEST(
+         COALESCE(users.last_seen_at, VALUES(last_seen_at)),
+         COALESCE(VALUES(last_seen_at), users.last_seen_at)
+       )`
+  );
+  if (result.affectedRows > 0) {
+    console.log(`Backfilled/updated users from chat_messages: affected=${result.affectedRows}`);
+  }
+}
+
+export async function upsertUsersFromMessages(messages: any[]): Promise<number> {
+  const db = getPool();
+  type UserRow = {
+    senderId: string;
+    screenName: string | null;
+    avatarUrl: string | null;
+    unix: number | null;
+  };
+  const byId = new Map<string, UserRow>();
+
+  for (const msg of messages) {
+    const senderId = getSenderId(msg);
+    if (!isNumericSenderId(senderId)) continue;
+    const unix = getMessageUnix(msg);
+    const screenName = getSenderName(msg);
+    const avatarUrl = getAvatarUrl(msg);
+    const prev = byId.get(senderId!);
+    if (!prev) {
+      byId.set(senderId!, { senderId: senderId!, screenName, avatarUrl, unix });
+      continue;
+    }
+    if (screenName) prev.screenName = screenName;
+    if (avatarUrl) prev.avatarUrl = avatarUrl;
+    if (unix != null && (prev.unix == null || unix > prev.unix)) prev.unix = unix;
+  }
+
+  if (byId.size === 0) return 0;
+
+  let affected = 0;
+  const list = Array.from(byId.values());
+  for (let i = 0; i < list.length; i += 100) {
+    const batch = list.slice(i, i + 100);
+    const placeholders = batch.map(() => "(?, ?, ?, 1, ?, ?)").join(", ");
+    const values: any[] = [];
+    for (const u of batch) {
+      const dt = toMysqlDatetime(u.unix);
+      values.push(
+        Number(u.senderId),
+        u.screenName,
+        u.avatarUrl,
+        dt,
+        dt
+      );
+    }
+    const [result] = await db.query<mysql.ResultSetHeader>(
+      `INSERT INTO users (sender_id, screen_name, avatar_url, message_count, first_seen_at, last_seen_at)
+       VALUES ${placeholders}
+       ON DUPLICATE KEY UPDATE
+         screen_name = COALESCE(VALUES(screen_name), users.screen_name),
+         avatar_url = COALESCE(VALUES(avatar_url), users.avatar_url),
+         message_count = users.message_count,
+         first_seen_at = LEAST(
+           COALESCE(users.first_seen_at, VALUES(first_seen_at)),
+           COALESCE(VALUES(first_seen_at), users.first_seen_at)
+         ),
+         last_seen_at = GREATEST(
+           COALESCE(users.last_seen_at, VALUES(last_seen_at)),
+           COALESCE(VALUES(last_seen_at), users.last_seen_at)
+         )`,
+      values
+    );
+    affected += result.affectedRows;
+  }
+  return affected;
 }
 
 export type UpsertMessagesResult = {
@@ -261,6 +435,13 @@ export async function upsertMessages(
       values
     );
     affected += result.affectedRows;
+  }
+
+  // 同步写入/更新 users 表
+  try {
+    await upsertUsersFromMessages(messages);
+  } catch (e) {
+    console.warn("upsert users failed:", e);
   }
 
   return {
@@ -487,6 +668,199 @@ function pageFromRows(
   };
 }
 
+async function attachUserProfiles(items: WeiboMessage[]): Promise<WeiboMessage[]> {
+  const ids = Array.from(
+    new Set(
+      items
+        .map((m) => m.senderId)
+        .filter((id): id is string => isNumericSenderId(id))
+    )
+  );
+  if (ids.length === 0) return items;
+
+  const db = getPool();
+  const [rows] = await db.query<mysql.RowDataPacket[]>(
+    `SELECT sender_id, screen_name, avatar_url
+     FROM users
+     WHERE sender_id IN (${ids.map(() => "?").join(",")})`,
+    ids.map((id) => Number(id))
+  );
+  const map = new Map<string, { screen_name?: string; avatar_url?: string }>();
+  for (const row of rows) {
+    map.set(String(row.sender_id), {
+      screen_name: row.screen_name ? String(row.screen_name) : undefined,
+      avatar_url: row.avatar_url ? String(row.avatar_url) : undefined,
+    });
+  }
+
+  return items.map((m) => {
+    const u = map.get(m.senderId);
+    if (!u) return m;
+    return {
+      ...m,
+      avatar: m.avatar || u.avatar_url,
+      senderName:
+        m.senderName && m.senderName !== "未知用户"
+          ? m.senderName
+          : u.screen_name || m.senderName,
+    };
+  });
+}
+
+export async function listGroupUsers(
+  groupId: string,
+  q?: string
+): Promise<ChatUserSummary[]> {
+  const db = getPool();
+  const params: any[] = [groupId];
+  let nameFilter = "";
+  if (q && q.trim()) {
+    nameFilter = ` AND (
+      cm.sender_name LIKE ?
+      OR u.screen_name LIKE ?
+      OR cm.sender_id LIKE ?
+    )`;
+    const like = `%${q.trim()}%`;
+    params.push(like, like, like);
+  }
+
+  const [rows] = await db.query<mysql.RowDataPacket[]>(
+    `SELECT
+       cm.sender_id AS sender_id,
+       COALESCE(MAX(NULLIF(u.screen_name, '')), MAX(NULLIF(cm.sender_name, '')), cm.sender_id) AS screen_name,
+       MAX(u.avatar_url) AS avatar_url,
+       COUNT(*) AS message_count
+     FROM chat_messages cm
+     LEFT JOIN users u
+       ON u.sender_id = CAST(cm.sender_id AS UNSIGNED)
+     WHERE cm.group_id = ?
+       AND cm.sender_id REGEXP '^[0-9]+$'
+       AND cm.sender_id <> '0'
+       ${nameFilter}
+     GROUP BY cm.sender_id
+     ORDER BY message_count DESC
+     LIMIT 5000`,
+    params
+  );
+
+  return rows.map((row) => {
+    const senderId = String(row.sender_id);
+    return {
+      senderId,
+      screenName: String(row.screen_name || senderId),
+      avatarUrl: row.avatar_url ? String(row.avatar_url) : null,
+      messageCount: Number(row.message_count || 0),
+      profileUrl: `https://weibo.com/u/${senderId}`,
+    };
+  });
+}
+
+/**
+ * 从该用户近期消息 raw_json 回填 users.avatar_url（及缺失昵称）。
+ * 仅在 avatar 为空时写入，供成员列表下滑懒加载。
+ */
+export async function fillUserAvatarFromMessages(
+  groupId: string,
+  senderId: string
+): Promise<ChatUserSummary | null> {
+  if (!isNumericSenderId(senderId)) return null;
+  const db = getPool();
+  const sid = String(senderId);
+
+  const [existingRows] = await db.query<mysql.RowDataPacket[]>(
+    `SELECT sender_id, screen_name, avatar_url, message_count
+     FROM users
+     WHERE sender_id = ?
+     LIMIT 1`,
+    [Number(sid)]
+  );
+  const existing = existingRows[0];
+  if (existing?.avatar_url) {
+    return {
+      senderId: sid,
+      screenName: String(existing.screen_name || sid),
+      avatarUrl: String(existing.avatar_url),
+      messageCount: Number(existing.message_count || 0),
+      profileUrl: `https://weibo.com/u/${sid}`,
+    };
+  }
+
+  // 取该群该用户最近若干条，从 raw_json 抠头像
+  const [msgRows] = await db.query<mysql.RowDataPacket[]>(
+    `SELECT raw_json, sender_name
+     FROM chat_messages
+     WHERE group_id = ? AND sender_id = ?
+     ORDER BY msg_time_unix DESC, id DESC
+     LIMIT 30`,
+    [groupId, sid]
+  );
+
+  let avatarUrl: string | null = null;
+  let screenName: string | null = existing?.screen_name
+    ? String(existing.screen_name)
+    : null;
+
+  for (const row of msgRows) {
+    if (!screenName && row.sender_name) {
+      screenName = String(row.sender_name);
+    }
+    const raw = row.raw_json;
+    let parsed: any = null;
+    if (typeof raw === "string") {
+      try {
+        parsed = JSON.parse(raw);
+      } catch {
+        parsed = null;
+      }
+    } else if (raw && typeof raw === "object") {
+      parsed = raw;
+    }
+    if (!parsed) continue;
+    if (!avatarUrl) avatarUrl = getAvatarUrl(parsed);
+    if (!screenName) screenName = getSenderName(parsed);
+    if (avatarUrl && screenName) break;
+  }
+
+  if (!avatarUrl && !screenName) {
+    // 仍无资料：返回当前汇总（可能只有发言数）
+    const [countRows] = await db.query<mysql.RowDataPacket[]>(
+      `SELECT COUNT(*) AS cnt FROM chat_messages WHERE group_id = ? AND sender_id = ?`,
+      [groupId, sid]
+    );
+    return {
+      senderId: sid,
+      screenName: sid,
+      avatarUrl: null,
+      messageCount: Number(countRows[0]?.cnt || 0),
+      profileUrl: `https://weibo.com/u/${sid}`,
+    };
+  }
+
+  const [countRows] = await db.query<mysql.RowDataPacket[]>(
+    `SELECT COUNT(*) AS cnt FROM chat_messages WHERE group_id = ? AND sender_id = ?`,
+    [groupId, sid]
+  );
+  const messageCount = Number(countRows[0]?.cnt || existing?.message_count || 0);
+
+  await db.query(
+    `INSERT INTO users (sender_id, screen_name, avatar_url, message_count)
+     VALUES (?, ?, ?, ?)
+     ON DUPLICATE KEY UPDATE
+       screen_name = COALESCE(VALUES(screen_name), users.screen_name),
+       avatar_url = COALESCE(VALUES(avatar_url), users.avatar_url),
+       message_count = GREATEST(users.message_count, VALUES(message_count))`,
+    [Number(sid), screenName, avatarUrl, messageCount]
+  );
+
+  return {
+    senderId: sid,
+    screenName: screenName || sid,
+    avatarUrl,
+    messageCount,
+    profileUrl: `https://weibo.com/u/${sid}`,
+  };
+}
+
 export async function listGroups(): Promise<ChatGroupSummary[]> {
   const db = getPool();
   const [rows] = await db.query<mysql.RowDataPacket[]>(
@@ -565,6 +939,15 @@ export async function queryMessagesPage(
   const limit = Math.min(Math.max(options.limit ?? 50, 1), 200);
   const direction = options.direction === "newer" ? "newer" : "older";
 
+  const finalize = async (
+    rows: mysql.RowDataPacket[],
+    opts: { hasMoreOlder: boolean; hasMoreNewer: boolean }
+  ): Promise<MessagePage> => {
+    const page = pageFromRows(groupId, rows, opts);
+    page.items = await attachUserProfiles(page.items);
+    return page;
+  };
+
   // 围绕某条消息加载上下文
   if (options.aroundId) {
     const [anchorRows] = await db.query<mysql.RowDataPacket[]>(
@@ -634,7 +1017,7 @@ export async function queryMessagesPage(
       [groupId, last.msg_time_unix, last.msg_time_unix, last.id]
     );
 
-    return pageFromRows(groupId, merged, {
+    return finalize(merged, {
       hasMoreOlder: checkOlder.length > 0,
       hasMoreNewer: checkNewer.length > 0,
     });
@@ -667,7 +1050,7 @@ export async function queryMessagesPage(
         )
       : [[] as mysql.RowDataPacket[]];
 
-    return pageFromRows(groupId, pageRows, {
+    return finalize(pageRows, {
       hasMoreOlder: checkOlder.length > 0,
       hasMoreNewer,
     });
@@ -687,7 +1070,7 @@ export async function queryMessagesPage(
     );
     const hasMoreOlder = rowsDesc.length > limit;
     const pageRows = (hasMoreOlder ? rowsDesc.slice(0, limit) : rowsDesc).reverse();
-    return pageFromRows(groupId, pageRows, {
+    return finalize(pageRows, {
       hasMoreOlder,
       hasMoreNewer: false,
     });
@@ -705,7 +1088,7 @@ export async function queryMessagesPage(
     );
     const hasMoreOlder = rowsDesc.length > limit;
     const pageRows = (hasMoreOlder ? rowsDesc.slice(0, limit) : rowsDesc).reverse();
-    return pageFromRows(groupId, pageRows, {
+    return finalize(pageRows, {
       hasMoreOlder,
       hasMoreNewer: true,
     });
@@ -722,7 +1105,7 @@ export async function queryMessagesPage(
   );
   const hasMoreNewer = rowsAsc.length > limit;
   const pageRows = hasMoreNewer ? rowsAsc.slice(0, limit) : rowsAsc;
-  return pageFromRows(groupId, pageRows, {
+  return finalize(pageRows, {
     hasMoreOlder: true,
     hasMoreNewer,
   });
@@ -732,6 +1115,7 @@ export async function searchMessages(options: {
   groupId: string;
   q?: string;
   sender?: string;
+  senderId?: string;
   cursor?: string | null;
   limit?: number;
 }): Promise<SearchPage> {
@@ -740,6 +1124,7 @@ export async function searchMessages(options: {
   const limit = Math.min(Math.max(options.limit ?? 30, 1), 100);
   const q = (options.q || "").trim();
   const sender = (options.sender || "").trim();
+  const senderId = (options.senderId || "").trim();
   const cursor = decodeCursor(options.cursor);
 
   const where: string[] = ["group_id = ?"];
@@ -749,11 +1134,14 @@ export async function searchMessages(options: {
     where.push("content LIKE ?");
     params.push(`%${q}%`);
   }
-  if (sender) {
+  if (senderId) {
+    where.push("sender_id = ?");
+    params.push(senderId);
+  } else if (sender) {
     where.push("sender_name LIKE ?");
     params.push(`%${sender}%`);
   }
-  if (!q && !sender) {
+  if (!q && !sender && !senderId) {
     return { groupId, items: [], nextCursor: null, hasMore: false };
   }
   if (cursor) {
@@ -773,7 +1161,7 @@ export async function searchMessages(options: {
 
   const hasMore = rows.length > limit;
   const pageRows = hasMore ? rows.slice(0, limit) : rows;
-  const items = pageRows.map(rowToMessage);
+  const items = await attachUserProfiles(pageRows.map(rowToMessage));
   const last = pageRows[pageRows.length - 1];
 
   return {

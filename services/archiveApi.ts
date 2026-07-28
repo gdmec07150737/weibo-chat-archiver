@@ -1,6 +1,7 @@
 import type {
   ChatDayStat,
   ChatGroupSummary,
+  ChatUserSummary,
   GroupStats,
   MessagePage,
   OverallStats,
@@ -52,17 +53,48 @@ export async function searchGroupMessages(params: {
   groupId: string;
   q?: string;
   sender?: string;
+  senderId?: string;
   cursor?: string | null;
   limit?: number;
 }): Promise<SearchPage> {
   const qs = new URLSearchParams();
   if (params.q) qs.set("q", params.q);
   if (params.sender) qs.set("sender", params.sender);
+  if (params.senderId) qs.set("senderId", params.senderId);
   if (params.cursor) qs.set("cursor", params.cursor);
   if (params.limit) qs.set("limit", String(params.limit));
   return getJson<SearchPage>(
     `/api/groups/${encodeURIComponent(params.groupId)}/search?${qs.toString()}`
   );
+}
+
+export async function fetchGroupUsers(
+  groupId: string,
+  q?: string
+): Promise<ChatUserSummary[]> {
+  const qs = new URLSearchParams();
+  if (q) qs.set("q", q);
+  const data = await getJson<{ users: ChatUserSummary[] }>(
+    `/api/groups/${encodeURIComponent(groupId)}/users${qs.toString() ? `?${qs}` : ""}`
+  );
+  return data.users || [];
+}
+
+/** 下滑成员列表时：从历史消息回填缺失的 avatar_url */
+export async function fillUserAvatar(
+  groupId: string,
+  senderId: string
+): Promise<ChatUserSummary> {
+  const res = await fetch(
+    `/api/groups/${encodeURIComponent(groupId)}/users/${encodeURIComponent(senderId)}/avatar`,
+    { method: "POST" }
+  );
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(text || `Fill avatar failed: ${res.status}`);
+  }
+  const data = (await res.json()) as { user: ChatUserSummary };
+  return data.user;
 }
 
 export async function fetchGroupStats(groupId: string): Promise<GroupStats> {

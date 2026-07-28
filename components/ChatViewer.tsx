@@ -13,12 +13,15 @@ import {
   ChevronDown,
 } from "lucide-react";
 import { format, isToday, isYesterday, isSameDay } from "date-fns";
-import type { ChatDayStat, ChatGroupSummary, WeiboMessage } from "../types";
+import type { ChatDayStat, ChatGroupSummary, ChatUserSummary, WeiboMessage } from "../types";
 import {
   fetchGroupDays,
+  fetchGroupUsers,
   fetchMessages,
+  fillUserAvatar,
   searchGroupMessages,
 } from "../services/archiveApi";
+import { toProxiedImageUrl } from "../services/imageProxy";
 
 interface ChatViewerProps {
   group: ChatGroupSummary;
@@ -28,15 +31,86 @@ interface ChatViewerProps {
 const PAGE_SIZE = 50;
 const MAX_WINDOW = 800;
 
-const MessageImage: React.FC<{ src: string }> = ({ src }) => {
+function weiboProfileUrl(senderId?: string): string | null {
+  if (!senderId || !/^\d+$/.test(senderId)) return null;
+  return `https://weibo.com/u/${senderId}`;
+}
+
+const ImageLightbox: React.FC<{ src: string; onClose: () => void }> = ({ src, onClose }) => {
+  // 弹窗优先直链；仅 sinaimg 才走本地代理
+  const [displaySrc, setDisplaySrc] = useState(src);
+  const [stage, setStage] = useState(0);
+
+  useEffect(() => {
+    setDisplaySrc(src);
+    setStage(0);
+  }, [src]);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  return (
+    <div
+      className="fixed inset-0 z-[100000] bg-black/80 flex items-center justify-center p-4"
+      onClick={onClose}
+    >
+      <button
+        className="absolute top-4 right-4 text-white/80 hover:text-white text-sm px-3 py-1.5 bg-white/10 rounded-lg"
+        onClick={onClose}
+      >
+        关闭 Esc
+      </button>
+      <img
+        src={displaySrc}
+        alt="预览"
+        className="max-w-[95vw] max-h-[90vh] object-contain rounded-lg shadow-2xl"
+        referrerPolicy="no-referrer"
+        onClick={(e) => e.stopPropagation()}
+        onError={() => {
+          if (stage === 0) {
+            const proxied = toProxiedImageUrl(src);
+            if (proxied && proxied !== src) {
+              setStage(1);
+              setDisplaySrc(proxied);
+            } else {
+              setStage(2);
+              setDisplaySrc(
+                `https://images.weserv.nl/?url=${encodeURIComponent(src.replace(/^https?:\/\//, ""))}`
+              );
+            }
+          } else if (stage === 1) {
+            setStage(2);
+            setDisplaySrc(
+              `https://images.weserv.nl/?url=${encodeURIComponent(src.replace(/^https?:\/\//, ""))}`
+            );
+          }
+        }}
+      />
+    </div>
+  );
+};
+
+const MessageImage: React.FC<{ src: string; onPreview: (src: string) => void }> = ({
+  src,
+  onPreview,
+}) => {
   const [error, setError] = useState(false);
-  const [retryWithProxy, setRetryWithProxy] = useState(false);
+  // 0: 直链  1: 本地代理(仅 sinaimg)  2: weserv 兜底
+  const [stage, setStage] = useState(0);
 
-  const imageUrl = retryWithProxy
-    ? `https://images.weserv.nl/?url=${encodeURIComponent(src.replace(/^https?:\/\//, ""))}`
-    : src;
+  const imageUrl =
+    stage === 0
+      ? src
+      : stage === 1
+        ? toProxiedImageUrl(src) || src
+        : `https://images.weserv.nl/?url=${encodeURIComponent(src.replace(/^https?:\/\//, ""))}`;
 
-  if (error && retryWithProxy) {
+  if (error) {
     return (
       <div className="flex flex-col items-center justify-center p-4 bg-gray-100 rounded-lg border border-dashed border-gray-300 text-gray-400">
         <ImageIcon className="w-8 h-8 mb-2 opacity-20" />
@@ -53,19 +127,31 @@ const MessageImage: React.FC<{ src: string }> = ({ src }) => {
         className="max-w-full max-h-[300px] object-contain cursor-zoom-in hover:scale-[1.02] transition-transform"
         referrerPolicy="no-referrer"
         onError={() => {
-          if (!retryWithProxy) setRetryWithProxy(true);
-          else setError(true);
+          if (stage === 0) {
+            // 直链失败：若是头像 CDN 才进代理，否则直接 weserv
+            const proxied = toProxiedImageUrl(src);
+            setStage(proxied && proxied !== src ? 1 : 2);
+          } else if (stage === 1) {
+            setStage(2);
+          } else {
+            setError(true);
+          }
         }}
-        onClick={() => window.open(imageUrl, "_blank")}
+        onClick={(e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          onPreview(src);
+        }}
       />
     </div>
   );
 };
 
-const MessageContent: React.FC<{ message: WeiboMessage; isMe: boolean }> = ({
-  message,
-  isMe,
-}) => {
+const MessageContent: React.FC<{
+  message: WeiboMessage;
+  isMe: boolean;
+  onImagePreview: (src: string) => void;
+}> = ({ message, isMe, onImagePreview }) => {
   const { content, attachments } = message;
   const trimmedContent = (content || "").trim();
 
@@ -152,7 +238,7 @@ const MessageContent: React.FC<{ message: WeiboMessage; isMe: boolean }> = ({
           {attachments.map((att, i) => (
             <React.Fragment key={i}>
               {att.type === "image" ? (
-                <MessageImage src={att.url} />
+                <MessageImage src={att.url} onPreview={onImagePreview} />
               ) : att.type === "video" ? (
                 <div
                   className="flex flex-col items-center justify-center p-4 bg-gray-100 rounded-lg border border-gray-200 text-indigo-600 hover:bg-gray-200 transition-colors cursor-pointer"
@@ -170,25 +256,42 @@ const MessageContent: React.FC<{ message: WeiboMessage; isMe: boolean }> = ({
   );
 };
 
-const MessageAvatar: React.FC<{ src?: string; name: string }> = ({ src, name }) => {
+const MessageAvatar: React.FC<{
+  src?: string;
+  name: string;
+  senderId?: string;
+}> = ({ src, name, senderId }) => {
   const [error, setError] = useState(false);
+  const profileUrl = weiboProfileUrl(senderId);
+  const proxied = toProxiedImageUrl(src);
 
-  if (!src || error) {
-    return (
+  const inner =
+    !proxied || error ? (
       <div className="w-full h-full bg-indigo-500 flex items-center justify-center text-white text-xs font-bold">
         {name.charAt(0)}
       </div>
+    ) : (
+      <img
+        src={proxied}
+        alt={name}
+        className="w-full h-full rounded-2xl object-cover"
+        onError={() => setError(true)}
+      />
     );
-  }
+
+  if (!profileUrl) return <>{inner}</>;
 
   return (
-    <img
-      src={src}
-      alt={name}
-      className="w-full h-full rounded-2xl object-cover"
-      referrerPolicy="no-referrer"
-      onError={() => setError(true)}
-    />
+    <a
+      href={profileUrl}
+      target="_blank"
+      rel="noopener noreferrer"
+      title={`打开微博主页：${name}`}
+      className="block w-full h-full rounded-2xl overflow-hidden hover:ring-2 hover:ring-indigo-400 transition-all"
+      onClick={(e) => e.stopPropagation()}
+    >
+      {inner}
+    </a>
   );
 };
 
@@ -232,6 +335,55 @@ const ChatViewer: React.FC<ChatViewerProps> = ({ group, onBack }) => {
   const [searching, setSearching] = useState(false);
   const [showSearchPanel, setShowSearchPanel] = useState(false);
   const [highlightedId, setHighlightedId] = useState<string | null>(null);
+  const [previewImage, setPreviewImage] = useState<string | null>(null);
+
+  const [showUserPanel, setShowUserPanel] = useState(false);
+  const [userQuery, setUserQuery] = useState("");
+  const [users, setUsers] = useState<ChatUserSummary[]>([]);
+  const [loadingUsers, setLoadingUsers] = useState(false);
+  const [activeSenderId, setActiveSenderId] = useState<string | null>(null);
+  const [activeSenderName, setActiveSenderName] = useState<string | null>(null);
+  const avatarFillInFlight = useRef<Set<string>>(new Set());
+  const avatarFillTried = useRef<Set<string>>(new Set());
+  const userListScrollRef = useRef<HTMLDivElement>(null);
+  const usersRef = useRef(users);
+  usersRef.current = users;
+
+  const fillAvatarIfNeeded = useCallback(
+    async (senderId: string) => {
+      if (!senderId || avatarFillTried.current.has(senderId)) return;
+      if (avatarFillInFlight.current.has(senderId)) return;
+
+      const current = usersRef.current.find((u) => u.senderId === senderId);
+      if (current?.avatarUrl) {
+        avatarFillTried.current.add(senderId);
+        return;
+      }
+
+      avatarFillInFlight.current.add(senderId);
+      avatarFillTried.current.add(senderId);
+      try {
+        const updated = await fillUserAvatar(group.groupId, senderId);
+        setUsers((prev) =>
+          prev.map((u) =>
+            u.senderId === senderId
+              ? {
+                  ...u,
+                  avatarUrl: updated.avatarUrl || u.avatarUrl,
+                  screenName: updated.screenName || u.screenName,
+                  messageCount: updated.messageCount || u.messageCount,
+                }
+              : u
+          )
+        );
+      } catch (e) {
+        console.warn("fill avatar failed:", senderId, e);
+      } finally {
+        avatarFillInFlight.current.delete(senderId);
+      }
+    },
+    [group.groupId]
+  );
 
   const parentRef = useRef<HTMLDivElement>(null);
   const loadingLock = useRef(false);
@@ -372,13 +524,15 @@ const ChatViewer: React.FC<ChatViewerProps> = ({ group, onBack }) => {
 
   const runSearch = async (reset = true) => {
     const q = searchInput.trim();
-    if (!q) return;
+    if (!q && !activeSenderId) return;
     setSearching(true);
     setShowSearchPanel(true);
+    setShowUserPanel(false);
     try {
       const page = await searchGroupMessages({
         groupId: group.groupId,
-        q,
+        q: q || undefined,
+        senderId: activeSenderId || undefined,
         cursor: reset ? null : searchCursor,
         limit: 30,
       });
@@ -390,6 +544,77 @@ const ChatViewer: React.FC<ChatViewerProps> = ({ group, onBack }) => {
     } finally {
       setSearching(false);
     }
+  };
+
+  const loadUsers = async (q?: string) => {
+    setLoadingUsers(true);
+    avatarFillTried.current.clear();
+    avatarFillInFlight.current.clear();
+    try {
+      const list = await fetchGroupUsers(group.groupId, q);
+      setUsers(list);
+    } catch (e: any) {
+      alert(e?.message || "加载成员失败");
+    } finally {
+      setLoadingUsers(false);
+    }
+  };
+
+  // 成员列表可视区域：缺头像的用户进入视口后回填 avatar_url
+  useEffect(() => {
+    if (!showUserPanel) return;
+    const root = userListScrollRef.current;
+    if (!root) return;
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          if (!entry.isIntersecting) continue;
+          const senderId = (entry.target as HTMLElement).dataset.senderId;
+          if (senderId) void fillAvatarIfNeeded(senderId);
+        }
+      },
+      { root, rootMargin: "80px 0px", threshold: 0.1 }
+    );
+
+    const nodes = root.querySelectorAll<HTMLElement>("[data-sender-id]");
+    nodes.forEach((node) => observer.observe(node));
+    return () => observer.disconnect();
+  }, [showUserPanel, users, fillAvatarIfNeeded]);
+
+  const openUserPanel = async () => {
+    setShowUserPanel(true);
+    setShowSearchPanel(false);
+    setShowDays(false);
+    if (users.length === 0) await loadUsers();
+  };
+
+  const searchByUser = async (user: ChatUserSummary) => {
+    setActiveSenderId(user.senderId);
+    setActiveSenderName(user.screenName);
+    setShowUserPanel(false);
+    setSearching(true);
+    setShowSearchPanel(true);
+    setSearchInput("");
+    try {
+      const page = await searchGroupMessages({
+        groupId: group.groupId,
+        senderId: user.senderId,
+        limit: 30,
+      });
+      setSearchResults(page.items);
+      setSearchCursor(page.nextCursor);
+      setSearchHasMore(page.hasMore);
+    } catch (e: any) {
+      alert(e?.message || "按用户搜索失败");
+    } finally {
+      setSearching(false);
+    }
+  };
+
+  const clearUserFilter = () => {
+    setActiveSenderId(null);
+    setActiveSenderName(null);
   };
 
   const openAround = async (messageId: string) => {
@@ -448,19 +673,29 @@ const ChatViewer: React.FC<ChatViewerProps> = ({ group, onBack }) => {
               onKeyDown={(e) => {
                 if (e.key === "Enter") void runSearch(true);
               }}
-              placeholder="搜索内容..."
+              placeholder={activeSenderName ? `在 ${activeSenderName} 中搜...` : "搜索内容..."}
               className="w-full pl-10 pr-4 py-2 bg-gray-50 border border-gray-200 rounded-xl focus:ring-2 focus:ring-indigo-100 focus:border-indigo-400 transition-all text-sm"
             />
           </div>
           <button
             onClick={() => void runSearch(true)}
-            disabled={searching || !searchInput.trim()}
+            disabled={searching || (!searchInput.trim() && !activeSenderId)}
             className="px-3 py-2 bg-indigo-600 text-white rounded-xl text-sm font-bold disabled:opacity-50"
           >
             {searching ? <Loader2 className="w-4 h-4 animate-spin" /> : "搜索"}
           </button>
           <button
-            onClick={() => setShowDays((v) => !v)}
+            onClick={() => void openUserPanel()}
+            className="px-3 py-2 bg-white border border-gray-200 rounded-xl text-sm font-semibold text-gray-700 flex items-center gap-1"
+          >
+            <User className="w-4 h-4" />
+            按用户查找
+          </button>
+          <button
+            onClick={() => {
+              setShowDays((v) => !v);
+              setShowUserPanel(false);
+            }}
             className="px-3 py-2 bg-white border border-gray-200 rounded-xl text-sm font-semibold text-gray-700 flex items-center gap-1"
           >
             <Calendar className="w-4 h-4" />
@@ -468,6 +703,100 @@ const ChatViewer: React.FC<ChatViewerProps> = ({ group, onBack }) => {
           </button>
         </div>
       </div>
+
+      {activeSenderName && (
+        <div className="bg-indigo-50 border-b border-indigo-100 px-4 py-2 text-xs text-indigo-800 flex items-center justify-between">
+          <span>
+            当前按用户筛选：<b>{activeSenderName}</b>（{activeSenderId}）
+          </span>
+          <button onClick={clearUserFilter} className="font-bold text-indigo-600">
+            清除
+          </button>
+        </div>
+      )}
+
+      {showUserPanel && (
+        <div
+          ref={userListScrollRef}
+          className="bg-white border-b border-gray-100 p-4 max-h-80 overflow-y-auto"
+        >
+          <div className="flex items-center gap-2 mb-3">
+            <div className="relative flex-1">
+              <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" />
+              <input
+                value={userQuery}
+                onChange={(e) => setUserQuery(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") void loadUsers(userQuery);
+                }}
+                placeholder="搜索群成员昵称或 UID..."
+                className="w-full pl-10 pr-4 py-2 bg-gray-50 border border-gray-200 rounded-xl text-sm"
+              />
+            </div>
+            <button
+              onClick={() => void loadUsers(userQuery)}
+              className="px-3 py-2 bg-indigo-600 text-white rounded-xl text-sm font-bold"
+            >
+              {loadingUsers ? <Loader2 className="w-4 h-4 animate-spin" /> : "查找"}
+            </button>
+            <button
+              onClick={() => setShowUserPanel(false)}
+              className="px-3 py-2 text-sm text-gray-500"
+            >
+              关闭
+            </button>
+          </div>
+          <div className="space-y-1">
+            {users.map((u) => (
+              <div
+                key={u.senderId}
+                data-sender-id={u.avatarUrl ? undefined : u.senderId}
+                className="flex items-center gap-3 p-2 rounded-xl hover:bg-gray-50"
+              >
+                <button
+                  onClick={() => void searchByUser(u)}
+                  className="flex items-center gap-3 flex-1 min-w-0 text-left"
+                >
+                  <div className="w-10 h-10 rounded-full overflow-hidden bg-indigo-100 flex-shrink-0">
+                    {toProxiedImageUrl(u.avatarUrl) ? (
+                      <img
+                        src={toProxiedImageUrl(u.avatarUrl)}
+                        alt={u.screenName}
+                        className="w-full h-full object-cover"
+                        onError={(e) => {
+                          (e.currentTarget as HTMLImageElement).style.display = "none";
+                        }}
+                      />
+                    ) : (
+                      <div className="w-full h-full flex items-center justify-center text-indigo-600 font-bold">
+                        {u.screenName.charAt(0)}
+                      </div>
+                    )}
+                  </div>
+                  <div className="min-w-0">
+                    <p className="text-sm font-bold text-gray-900 truncate">{u.screenName}</p>
+                    <p className="text-[10px] text-gray-400">
+                      {u.messageCount.toLocaleString()} 条 · {u.senderId}
+                    </p>
+                  </div>
+                </button>
+                <a
+                  href={u.profileUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-xs text-indigo-600 font-semibold px-2 py-1 hover:bg-indigo-50 rounded-lg"
+                  title="打开微博主页"
+                >
+                  主页
+                </a>
+              </div>
+            ))}
+            {!loadingUsers && users.length === 0 && (
+              <p className="text-sm text-gray-400 text-center py-6">暂无成员数据</p>
+            )}
+          </div>
+        </div>
+      )}
 
       {showDays && (
         <div className="bg-white border-b border-gray-100 p-4 max-h-48 overflow-y-auto">
@@ -619,7 +948,11 @@ const ChatViewer: React.FC<ChatViewerProps> = ({ group, onBack }) => {
                       !isFirstInSequence ? "opacity-0" : ""
                     }`}
                   >
-                    <MessageAvatar src={msg.avatar} name={msg.senderName} />
+                    <MessageAvatar
+                      src={msg.avatar}
+                      name={msg.senderName}
+                      senderId={msg.senderId}
+                    />
                   </div>
                   <div
                     className={`max-w-[70%] ${
@@ -628,11 +961,22 @@ const ChatViewer: React.FC<ChatViewerProps> = ({ group, onBack }) => {
                   >
                     {isFirstInSequence && (
                       <div className="flex items-center gap-2 mb-1 px-1">
-                        <span className="text-xs font-bold text-gray-700">
-                          {msg.senderName}
-                        </span>
+                        {weiboProfileUrl(msg.senderId) ? (
+                          <a
+                            href={weiboProfileUrl(msg.senderId)!}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="text-xs font-bold text-gray-700 hover:text-indigo-600"
+                          >
+                            {msg.senderName}
+                          </a>
+                        ) : (
+                          <span className="text-xs font-bold text-gray-700">
+                            {msg.senderName}
+                          </span>
+                        )}
                         <span className="text-[10px] text-gray-400">
-                          {format(new Date(msg.timestamp), "HH:mm")}
+                          {format(new Date(msg.timestamp), "yyyy/MM/dd HH:mm")}
                         </span>
                       </div>
                     )}
@@ -643,7 +987,11 @@ const ChatViewer: React.FC<ChatViewerProps> = ({ group, onBack }) => {
                           : "bg-white text-gray-800 border border-gray-100 rounded-tl-none"
                       }`}
                     >
-                      <MessageContent message={msg} isMe={isMe} />
+                      <MessageContent
+                        message={msg}
+                        isMe={isMe}
+                        onImagePreview={setPreviewImage}
+                      />
                     </div>
                   </div>
                 </div>
@@ -667,6 +1015,10 @@ const ChatViewer: React.FC<ChatViewerProps> = ({ group, onBack }) => {
           <User className="w-3 h-3" /> UID: {group.groupId}
         </span>
       </div>
+
+      {previewImage && (
+        <ImageLightbox src={previewImage} onClose={() => setPreviewImage(null)} />
+      )}
     </div>
   );
 };

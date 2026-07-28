@@ -87,6 +87,11 @@ export const generateCollectorScript = (groupId: string = '', appUrl: string = '
   let maxMid = "";
   let page = 1;
   const count = 20;
+  // 跨午夜/瞬时网络抖动时，微博接口可能短暂空响应或报错；不要立刻结束
+  const MAX_EMPTY_STREAK = isHistoryMode ? 5 : 0; // 监控模式永不因空页停止
+  const MAX_ERROR_STREAK = 8;
+  let emptyStreak = 0;
+  let errorStreak = 0;
 
   const updateUI = (status) => {
     const statusEl = document.getElementById('wb-status');
@@ -102,6 +107,8 @@ export const generateCollectorScript = (groupId: string = '', appUrl: string = '
         : \`本轮见到 \${sessionSeenCount} 条\`;
     }
   };
+
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
   const flushToServer = async (msgs, label) => {
     if (!msgs.length) return true;
@@ -187,29 +194,60 @@ export const generateCollectorScript = (groupId: string = '', appUrl: string = '
     while (running) {
       updateUI(\`正在抓取第 \${page} 页...\`);
       console.log(\`[采集器] 正在请求第 \${page} 页, max_mid: \${maxMid || '无'}\`);
-      
-      const url = \`https://api.weibo.com/webim/groupchat/query_messages.json?convert_emoji=1&query_sender=1&count=\${count}&id=\${groupId}\${(isHistoryMode && maxMid) ? "&max_mid=" + maxMid : ""}&source=209678993&t=\${Date.now()}\`;
-      
-      const response = await fetch(url);
-      const data = await response.json();
-      
-      if (data.error || data.error_code) {
-        console.error("[采集器] 微博接口返回错误:", data);
-        updateUI(\`接口错误: \${data.error || data.error_code}\`);
-        break;
+
+      let data = null;
+      try {
+        const url = \`https://api.weibo.com/webim/groupchat/query_messages.json?convert_emoji=1&query_sender=1&count=\${count}&id=\${groupId}\${(isHistoryMode && maxMid) ? "&max_mid=" + maxMid : ""}&source=209678993&t=\${Date.now()}\`;
+        const response = await fetch(url, { credentials: "include" });
+        if (!response.ok) {
+          throw new Error("HTTP " + response.status);
+        }
+        data = await response.json();
+      } catch (fetchErr) {
+        errorStreak++;
+        console.warn(\`[采集器] 请求异常 (\${errorStreak}/\${MAX_ERROR_STREAK}):\`, fetchErr.message || fetchErr);
+        updateUI(\`请求异常，\${Math.min(30, 3 * errorStreak)} 秒后重试...\`);
+        if (errorStreak >= MAX_ERROR_STREAK) {
+          updateUI("连续请求失败过多，已暂停（可点停止后重新开书签续采）");
+          break;
+        }
+        await sleep(Math.min(30000, 3000 * errorStreak));
+        continue;
       }
 
+      if (data.error || data.error_code) {
+        errorStreak++;
+        console.warn("[采集器] 微博接口返回错误:", data);
+        updateUI(\`接口错误(\${data.error || data.error_code})，稍后重试...\`);
+        if (errorStreak >= MAX_ERROR_STREAK) {
+          updateUI(\`连续接口错误过多: \${data.error || data.error_code}\`);
+          break;
+        }
+        await sleep(Math.min(30000, 3000 * errorStreak));
+        continue;
+      }
+
+      errorStreak = 0;
       const messages = data.messages || [];
       console.log(\`[采集器] 本页抓取到 \${messages.length} 条消息\`);
 
       if (messages.length === 0) {
+        emptyStreak++;
         if (isHistoryMode) {
-          updateUI("已抓取全部历史记录");
-          break;
+          console.warn(\`[采集器] 空页 (\${emptyStreak}/\${MAX_EMPTY_STREAK})，可能是跨午夜瞬时空响应\`);
+          updateUI(\`空页重试 \${emptyStreak}/\${MAX_EMPTY_STREAK}...\`);
+          if (emptyStreak >= MAX_EMPTY_STREAK) {
+            updateUI("已抓取全部历史记录（连续空页）");
+            break;
+          }
+          await sleep(Math.min(20000, 2000 * emptyStreak));
+          continue;
         } else {
           console.log("[采集器] 暂无新消息");
+          emptyStreak = 0;
         }
       } else {
+        emptyStreak = 0;
         const pageNew = [];
         messages.forEach(msg => {
           const id = (msg.id || msg.mid || msg.idstr || "").toString();
@@ -245,22 +283,30 @@ export const generateCollectorScript = (groupId: string = '', appUrl: string = '
               oldestMsg = messages[i];
             }
           }
-          
+
           const nextCursor = (oldestMsg.mid || oldestMsg.id || oldestMsg.idstr || "").toString();
           console.log(\`[采集器] 下一页游标 (max_mid): \${nextCursor}\`);
 
           if (!nextCursor || nextCursor === maxMid) {
-            console.log("[采集器] 游标未变化或无效，停止抓取");
-            if (pageNew.length === 0) break;
+            console.log("[采集器] 游标未变化或无效");
+            // 本页全是重复且游标不变 → 可能到头；再给几次空/重复机会
+            if (pageNew.length === 0) {
+              emptyStreak++;
+              if (emptyStreak >= MAX_EMPTY_STREAK) {
+                updateUI("游标不再推进，历史抓取结束");
+                break;
+              }
+            }
+          } else {
+            maxMid = nextCursor;
           }
-          maxMid = nextCursor;
         }
       }
-      
+
       if (!running) break;
-      
+
       console.log(\`[采集器] 等待 \${interval/1000} 秒后继续...\`);
-      await new Promise(r => setTimeout(r, interval));
+      await sleep(interval);
       page++;
     }
 
