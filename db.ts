@@ -216,6 +216,13 @@ export async function ensureSchema(): Promise<void> {
 
   await migrateFromLegacyArchives(db);
   await ensureUsersSchema(db);
+  try {
+    await db.query(
+      `ALTER TABLE chat_messages ADD KEY idx_group_sender (group_id, sender_id)`
+    );
+  } catch {
+    // already exists
+  }
   await repairMsgTimeTimezone(db);
   await backfillUsersFromMessages(db);
 }
@@ -709,50 +716,66 @@ async function attachUserProfiles(items: WeiboMessage[]): Promise<WeiboMessage[]
 
 export async function listGroupUsers(
   groupId: string,
-  q?: string
-): Promise<ChatUserSummary[]> {
+  q?: string,
+  options?: { limit?: number; offset?: number }
+): Promise<{
+  users: ChatUserSummary[];
+  offset: number;
+  limit: number;
+  hasMore: boolean;
+  nextOffset: number | null;
+}> {
   const db = getPool();
-  const params: any[] = [groupId];
-  let nameFilter = "";
-  if (q && q.trim()) {
-    nameFilter = ` AND (
-      cm.sender_name LIKE ?
-      OR u.screen_name LIKE ?
-      OR cm.sender_id LIKE ?
-    )`;
-    const like = `%${q.trim()}%`;
-    params.push(like, like, like);
+  const limit = Math.min(Math.max(options?.limit ?? 500, 1), 500);
+  const offset = Math.max(options?.offset ?? 0, 0);
+  const keyword = q?.trim() || "";
+
+  // 不统计发言数；从 users 表分页，EXISTS 限定本群（避免对消息大表 GROUP BY + COUNT）
+  const bind: any[] = [];
+  let sql = `
+    SELECT
+      CAST(u.sender_id AS CHAR) AS sender_id,
+      COALESCE(NULLIF(u.screen_name, ''), CAST(u.sender_id AS CHAR)) AS screen_name,
+      u.avatar_url AS avatar_url
+    FROM users u
+    WHERE u.sender_id > 0`;
+  if (keyword) {
+    sql += ` AND (u.screen_name LIKE ? OR CAST(u.sender_id AS CHAR) LIKE ?)`;
+    bind.push(`%${keyword}%`, `%${keyword}%`);
   }
+  sql += `
+      AND EXISTS (
+        SELECT 1
+        FROM chat_messages cm
+        WHERE cm.group_id = ?
+          AND cm.sender_id = CAST(u.sender_id AS CHAR)
+        LIMIT 1
+      )
+    ORDER BY u.sender_id ASC
+    LIMIT ? OFFSET ?`;
+  bind.push(groupId, limit + 1, offset);
 
-  const [rows] = await db.query<mysql.RowDataPacket[]>(
-    `SELECT
-       cm.sender_id AS sender_id,
-       COALESCE(MAX(NULLIF(u.screen_name, '')), MAX(NULLIF(cm.sender_name, '')), cm.sender_id) AS screen_name,
-       MAX(u.avatar_url) AS avatar_url,
-       COUNT(*) AS message_count
-     FROM chat_messages cm
-     LEFT JOIN users u
-       ON u.sender_id = CAST(cm.sender_id AS UNSIGNED)
-     WHERE cm.group_id = ?
-       AND cm.sender_id REGEXP '^[0-9]+$'
-       AND cm.sender_id <> '0'
-       ${nameFilter}
-     GROUP BY cm.sender_id
-     ORDER BY message_count DESC
-     LIMIT 5000`,
-    params
-  );
+  const [page] = await db.query<mysql.RowDataPacket[]>(sql, bind);
 
-  return rows.map((row) => {
+  const hasMore = page.length > limit;
+  const pageRows = hasMore ? page.slice(0, limit) : page;
+  const users = pageRows.map((row) => {
     const senderId = String(row.sender_id);
     return {
       senderId,
       screenName: String(row.screen_name || senderId),
       avatarUrl: row.avatar_url ? String(row.avatar_url) : null,
-      messageCount: Number(row.message_count || 0),
       profileUrl: `https://weibo.com/u/${senderId}`,
     };
   });
+
+  return {
+    users,
+    offset,
+    limit,
+    hasMore,
+    nextOffset: hasMore ? offset + limit : null,
+  };
 }
 
 /**
@@ -780,7 +803,6 @@ export async function fillUserAvatarFromMessages(
       senderId: sid,
       screenName: String(existing.screen_name || sid),
       avatarUrl: String(existing.avatar_url),
-      messageCount: Number(existing.message_count || 0),
       profileUrl: `https://weibo.com/u/${sid}`,
     };
   }
@@ -822,41 +844,27 @@ export async function fillUserAvatarFromMessages(
   }
 
   if (!avatarUrl && !screenName) {
-    // 仍无资料：返回当前汇总（可能只有发言数）
-    const [countRows] = await db.query<mysql.RowDataPacket[]>(
-      `SELECT COUNT(*) AS cnt FROM chat_messages WHERE group_id = ? AND sender_id = ?`,
-      [groupId, sid]
-    );
     return {
       senderId: sid,
       screenName: sid,
       avatarUrl: null,
-      messageCount: Number(countRows[0]?.cnt || 0),
       profileUrl: `https://weibo.com/u/${sid}`,
     };
   }
 
-  const [countRows] = await db.query<mysql.RowDataPacket[]>(
-    `SELECT COUNT(*) AS cnt FROM chat_messages WHERE group_id = ? AND sender_id = ?`,
-    [groupId, sid]
-  );
-  const messageCount = Number(countRows[0]?.cnt || existing?.message_count || 0);
-
   await db.query(
     `INSERT INTO users (sender_id, screen_name, avatar_url, message_count)
-     VALUES (?, ?, ?, ?)
+     VALUES (?, ?, ?, 0)
      ON DUPLICATE KEY UPDATE
        screen_name = COALESCE(VALUES(screen_name), users.screen_name),
-       avatar_url = COALESCE(VALUES(avatar_url), users.avatar_url),
-       message_count = GREATEST(users.message_count, VALUES(message_count))`,
-    [Number(sid), screenName, avatarUrl, messageCount]
+       avatar_url = COALESCE(VALUES(avatar_url), users.avatar_url)`,
+    [Number(sid), screenName, avatarUrl]
   );
 
   return {
     senderId: sid,
     screenName: screenName || sid,
     avatarUrl,
-    messageCount,
     profileUrl: `https://weibo.com/u/${sid}`,
   };
 }

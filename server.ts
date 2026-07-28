@@ -61,21 +61,37 @@ async function startServer() {
         return res.status(403).send("Host not allowed");
       }
 
-      const upstream = await fetch(target.toString(), {
-        headers: {
-          Referer: "https://weibo.com/",
-          "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-          Accept: "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-        },
-        redirect: "follow",
-      });
+      const referers = [
+        "https://photo.weibo.com/",
+        "https://weibo.com/",
+        "https://m.weibo.cn/",
+      ];
+      const commonHeaders = {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        Accept: "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+      };
 
-      if (!upstream.ok) {
+      let upstream: Response | null = null;
+      for (const referer of referers) {
+        const resp = await fetch(target.toString(), {
+          headers: { ...commonHeaders, Referer: referer },
+          redirect: "follow",
+        });
+        if (resp.ok) {
+          upstream = resp;
+          break;
+        }
+        upstream = resp;
+      }
+
+      if (!upstream || !upstream.ok) {
         console.warn(
-          `img-proxy upstream ${upstream.status} for ${target.hostname}`
+          `img-proxy upstream ${upstream?.status || "?"} for ${target.hostname}`
         );
-        return res.status(upstream.status).send(`Upstream ${upstream.status}`);
+        return res
+          .status(upstream?.status || 502)
+          .send(`Upstream ${upstream?.status || "error"}`);
       }
 
       const contentType = upstream.headers.get("content-type") || "image/jpeg";
@@ -91,6 +107,75 @@ async function startServer() {
     } catch (error) {
       console.error("img-proxy failed:", error);
       return res.status(502).send("Proxy failed");
+    }
+  });
+
+  /**
+   * media_type=9 表情：url_long 是 H5 页，解析其中 <img src="...sinaimg...gif"> 再带 Referer 拉取。
+   * 用法：/api/weibo-compic?url=https://photo.weibo.com/h5/comment/compic_id/...
+   */
+  app.get("/api/weibo-compic", async (req, res) => {
+    try {
+      const raw = typeof req.query.url === "string" ? req.query.url : "";
+      if (!raw) return res.status(400).send("Missing url");
+
+      let page: URL;
+      try {
+        page = new URL(raw);
+      } catch {
+        return res.status(400).send("Invalid url");
+      }
+      if (!/(^|\.)(photo\.weibo\.com|weibo\.com)$/i.test(page.hostname)) {
+        return res.status(403).send("Host not allowed");
+      }
+
+      const pageResp = await fetch(page.toString(), {
+        headers: {
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+          Accept: "text/html,application/xhtml+xml",
+          Referer: "https://weibo.com/",
+        },
+        redirect: "follow",
+      });
+      if (!pageResp.ok) {
+        return res.status(pageResp.status).send(`Page ${pageResp.status}`);
+      }
+      const html = await pageResp.text();
+      const imgMatch = html.match(
+        /src=["'](https?:\/\/[^"']*sinaimg\.cn[^"']+\.gif)["']/i
+      );
+      if (!imgMatch?.[1]) {
+        return res.status(404).send("Gif not found in page");
+      }
+
+      const gifUrl = imgMatch[1].replace(/^http:/, "https:");
+      if (!isAllowedProxyTarget(gifUrl)) {
+        return res.status(403).send("Gif host not allowed");
+      }
+
+      const gifResp = await fetch(gifUrl, {
+        headers: {
+          Referer: "https://photo.weibo.com/",
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+          Accept: "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+        },
+        redirect: "follow",
+      });
+      if (!gifResp.ok) {
+        return res.status(gifResp.status).send(`Gif ${gifResp.status}`);
+      }
+
+      const contentType = gifResp.headers.get("content-type") || "image/gif";
+      const buf = Buffer.from(await gifResp.arrayBuffer());
+      res.setHeader("Content-Type", contentType);
+      res.setHeader("Cache-Control", "public, max-age=86400");
+      res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
+      return res.send(buf);
+    } catch (error) {
+      console.error("weibo-compic failed:", error);
+      return res.status(502).send("Compic proxy failed");
     }
   });
 
@@ -223,8 +308,13 @@ async function startServer() {
       const groupId = String(req.params.groupId || "");
       if (!groupId) return res.status(400).json({ error: "Missing groupId" });
       const q = typeof req.query.q === "string" ? req.query.q : "";
-      const users = await listGroupUsers(groupId, q || undefined);
-      res.json({ groupId, users });
+      const limit = Number(req.query.limit || 500);
+      const offset = Number(req.query.offset || 0);
+      const page = await listGroupUsers(groupId, q || undefined, {
+        limit,
+        offset,
+      });
+      res.json({ groupId, ...page });
     } catch (error) {
       console.error("Failed to list group users:", error);
       res.status(500).json({ error: "Failed to list group users" });

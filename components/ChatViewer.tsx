@@ -11,9 +11,20 @@ import {
   Loader2,
   ChevronUp,
   ChevronDown,
+  FileText,
+  Mic,
+  Film,
+  Gift,
+  Link2,
 } from "lucide-react";
 import { format, isToday, isYesterday, isSameDay } from "date-fns";
-import type { ChatDayStat, ChatGroupSummary, ChatUserSummary, WeiboMessage } from "../types";
+import type {
+  ChatDayStat,
+  ChatGroupSummary,
+  ChatUserSummary,
+  MessageAttachment,
+  WeiboMessage,
+} from "../types";
 import {
   fetchGroupDays,
   fetchGroupUsers,
@@ -152,8 +163,11 @@ const MessageContent: React.FC<{
   isMe: boolean;
   onImagePreview: (src: string) => void;
 }> = ({ message, isMe, onImagePreview }) => {
-  const { content, attachments } = message;
+  const { content, attachments, mediaType } = message;
   const trimmedContent = (content || "").trim();
+  const hidePlaceholderText =
+    !!attachments?.length &&
+    ["分享图片", "分享视频", "分享语音", "[动画表情]"].includes(trimmedContent);
 
   const renderTextWithLinksAndEmojis = (text: string) => {
     const urlRegex = /(https?:\/\/[^\s]+|weibo\.com\/[^\s]+)/g;
@@ -192,65 +206,262 @@ const MessageContent: React.FC<{
 
   const quoteMatch = trimmedContent.match(/^「([\s\S]*?)」([\s\S]*)$/);
 
-  let mainContent = (
-    <div className="text-[14px] whitespace-pre-wrap leading-relaxed px-1 break-words">
-      {renderTextWithLinksAndEmojis(content || "")}
-    </div>
-  );
+  let mainContent: React.ReactNode = null;
+  if (!hidePlaceholderText && trimmedContent) {
+    // 链接类消息：正文是 URL 时，若已有附件卡片则不再重复刷一整段 URL
+    const isUrlOnly =
+      (mediaType === 9 || mediaType === 11 || mediaType === 14 || mediaType === 13) &&
+      /^https?:\/\//i.test(trimmedContent) &&
+      !!attachments?.length;
 
-  if (quoteMatch) {
-    const quoted = quoteMatch[1];
-    const rest = quoteMatch[2].trim();
-    const replyMatch = rest.match(/^[ \t\n]*[-—]{3,}[ \t\n]*([\s\S]*)$/);
-    const reply = replyMatch ? replyMatch[1].trim() : rest;
-
-    if (quoted && reply) {
+    if (!isUrlOnly) {
       mainContent = (
-        <div className="flex flex-col gap-1 min-w-[120px]">
-          <div
-            className={`text-[11px] px-2 py-1 rounded-lg mb-1 border-l-2 ${
-              isMe
-                ? "bg-indigo-500/30 border-indigo-200 text-indigo-100"
-                : "bg-gray-100 border-gray-300 text-gray-500"
-            }`}
-          >
-            <span className="opacity-60">引用: </span>
-            {renderTextWithLinksAndEmojis(quoted)}
-          </div>
-          <div
-            className={`border-t border-dashed my-1 w-full opacity-40 ${
-              isMe ? "border-white" : "border-gray-400"
-            }`}
-          />
-          <div className="text-[14px] whitespace-pre-wrap leading-relaxed px-1 break-words">
-            {renderTextWithLinksAndEmojis(reply)}
-          </div>
+        <div className="text-[14px] whitespace-pre-wrap leading-relaxed px-1 break-words">
+          {renderTextWithLinksAndEmojis(content || "")}
         </div>
       );
+
+      if (quoteMatch) {
+        const quoted = quoteMatch[1];
+        const rest = quoteMatch[2].trim();
+        const replyMatch = rest.match(/^[ \t\n]*[-—]{3,}[ \t\n]*([\s\S]*)$/);
+        const reply = replyMatch ? replyMatch[1].trim() : rest;
+
+        if (quoted && reply) {
+          mainContent = (
+            <div className="flex flex-col gap-1 min-w-[120px]">
+              <div
+                className={`text-[11px] px-2 py-1 rounded-lg mb-1 border-l-2 ${
+                  isMe
+                    ? "bg-indigo-500/30 border-indigo-200 text-indigo-100"
+                    : "bg-gray-100 border-gray-300 text-gray-500"
+                }`}
+              >
+                <span className="opacity-60">引用: </span>
+                {renderTextWithLinksAndEmojis(quoted)}
+              </div>
+              <div
+                className={`border-t border-dashed my-1 w-full opacity-40 ${
+                  isMe ? "border-white" : "border-gray-400"
+                }`}
+              />
+              <div className="text-[14px] whitespace-pre-wrap leading-relaxed px-1 break-words">
+                {renderTextWithLinksAndEmojis(reply)}
+              </div>
+            </div>
+          );
+        }
+      }
     }
   }
+
+  const cardClass = isMe
+    ? "bg-indigo-500/25 border-indigo-300/40 text-indigo-50"
+    : "bg-gray-50 border-gray-200 text-gray-700";
+
+  const renderAttachment = (att: MessageAttachment, i: number) => {
+    switch (att.type) {
+      case "image":
+        return att.url ? (
+          <MessageImage key={i} src={att.url} onPreview={onImagePreview} />
+        ) : null;
+      case "emoji": {
+        // media_type=9：真实 gif 在 sinaimg（防盗链），优先 img-proxy；失败再走 weibo-compic 解析 url_long
+        // media_type=15：sinaimg 直链，走代理
+        const isType9 = att.mediaType === 9;
+        const pageUrl =
+          isType9 && att.description?.includes("photo.weibo.com")
+            ? att.description
+            : isType9 && att.url?.includes("photo.weibo.com")
+              ? att.url
+              : null;
+        const gifUrl =
+          isType9 && att.url && /sinaimg\.cn/i.test(att.url) ? att.url : null;
+
+        let src: string | undefined;
+        if (isType9) {
+          if (gifUrl) src = toProxiedImageUrl(gifUrl) || gifUrl;
+          else if (pageUrl)
+            src = `/api/weibo-compic?url=${encodeURIComponent(pageUrl)}`;
+        } else {
+          src = toProxiedImageUrl(att.url) || att.url;
+        }
+        if (!src) return null;
+
+        return (
+          <button
+            key={i}
+            type="button"
+            className="block"
+            onClick={() => onImagePreview(src)}
+            title={att.title || "表情"}
+          >
+            <img
+              src={src}
+              alt={att.title || "表情"}
+              className="max-w-[160px] max-h-[160px] object-contain"
+              onError={(e) => {
+                const el = e.currentTarget;
+                if (isType9 && pageUrl && !el.dataset.fallback) {
+                  el.dataset.fallback = "1";
+                  el.src = `/api/weibo-compic?url=${encodeURIComponent(pageUrl)}`;
+                  return;
+                }
+                if (!isType9 && !el.dataset.fallback && att.url) {
+                  el.dataset.fallback = "1";
+                  el.src = `https://images.weserv.nl/?url=${encodeURIComponent(
+                    att.url.replace(/^https?:\/\//, "")
+                  )}`;
+                }
+              }}
+            />
+          </button>
+        );
+      }
+      case "video":
+        return (
+          <div key={i} className={`rounded-xl border p-3 min-w-[200px] ${cardClass}`}>
+            <div className="flex items-center gap-2 mb-2 text-sm font-bold">
+              <Film className="w-4 h-4" />
+              {att.title || "视频"}
+            </div>
+            {att.url ? (
+              <video
+                src={att.url}
+                controls
+                preload="metadata"
+                className="w-full max-h-[280px] rounded-lg bg-black/80"
+              />
+            ) : null}
+          </div>
+        );
+      case "audio": {
+        // 微博语音多为 AMR，浏览器无法直接播放，提供下载
+        const fileName =
+          att.title && /\.amr$/i.test(att.title)
+            ? att.title
+            : att.title
+              ? `${att.title}.amr`
+              : "voice.amr";
+        return (
+          <a
+            key={i}
+            href={att.url}
+            target="_blank"
+            rel="noopener noreferrer"
+            download={fileName}
+            className={`flex items-center gap-3 rounded-xl border px-3 py-2.5 min-w-[220px] hover:opacity-90 ${cardClass}`}
+          >
+            <Mic className="w-5 h-5 flex-shrink-0" />
+            <div className="min-w-0">
+              <p className="text-sm font-bold truncate">{fileName}</p>
+              <p className="text-[10px] opacity-70">
+                AMR 格式浏览器无法播放，点击下载后用播放器打开
+              </p>
+            </div>
+          </a>
+        );
+      }
+      case "file":
+        return (
+          <a
+            key={i}
+            href={att.url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className={`flex items-center gap-3 rounded-xl border px-3 py-2.5 min-w-[200px] hover:opacity-90 ${cardClass}`}
+          >
+            <FileText className="w-5 h-5 flex-shrink-0" />
+            <div className="min-w-0">
+              <p className="text-sm font-bold truncate">{att.title || "文件"}</p>
+              <p className="text-[10px] opacity-70">点击下载 / 打开</p>
+            </div>
+          </a>
+        );
+      case "link":
+        return (
+          <a
+            key={i}
+            href={att.url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className={`block rounded-xl border px-3 py-2.5 min-w-[200px] max-w-[320px] hover:opacity-90 ${cardClass}`}
+          >
+            <div className="flex items-center gap-2 text-sm font-bold mb-1">
+              <Link2 className="w-4 h-4" />
+              {att.title || "链接"}
+            </div>
+            <p className="text-xs opacity-80 break-all line-clamp-3">
+              {att.description || att.url}
+            </p>
+          </a>
+        );
+      case "weibo_post":
+        return (
+          <a
+            key={i}
+            href={att.url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className={`block rounded-xl border px-3 py-2.5 min-w-[220px] max-w-[340px] hover:opacity-90 ${cardClass}`}
+          >
+            <div className="flex items-center gap-2 text-sm font-bold mb-1">
+              <ExternalLink className="w-4 h-4" />
+              {att.title || "微博"}
+            </div>
+            {att.description ? (
+              <p className="text-xs opacity-90 whitespace-pre-wrap line-clamp-4">
+                {att.description}
+              </p>
+            ) : null}
+            {att.url ? (
+              <p className="text-[10px] opacity-60 mt-1 break-all">{att.url}</p>
+            ) : null}
+          </a>
+        );
+      case "red_packet":
+        return (
+          <div
+            key={i}
+            className={`flex items-center gap-3 rounded-xl border px-3 py-2.5 min-w-[200px] ${
+              isMe
+                ? "bg-amber-500/20 border-amber-300/40 text-amber-50"
+                : "bg-amber-50 border-amber-200 text-amber-800"
+            }`}
+          >
+            <Gift className="w-5 h-5 flex-shrink-0" />
+            <div>
+              <p className="text-sm font-bold">{att.title || "红包"}</p>
+              <p className="text-xs opacity-80">
+                {att.description || "请在手机上查看"}
+              </p>
+            </div>
+          </div>
+        );
+      case "system":
+        return (
+          <div
+            key={i}
+            className={`rounded-xl border px-3 py-2 text-xs ${cardClass}`}
+          >
+            {att.description || att.title || "系统消息"}
+          </div>
+        );
+      default:
+        return null;
+    }
+  };
 
   return (
     <div className="space-y-2">
       {mainContent}
       {attachments && attachments.length > 0 && (
-        <div className="flex flex-wrap gap-2 mt-2">
-          {attachments.map((att, i) => (
-            <React.Fragment key={i}>
-              {att.type === "image" ? (
-                <MessageImage src={att.url} onPreview={onImagePreview} />
-              ) : att.type === "video" ? (
-                <div
-                  className="flex flex-col items-center justify-center p-4 bg-gray-100 rounded-lg border border-gray-200 text-indigo-600 hover:bg-gray-200 transition-colors cursor-pointer"
-                  onClick={() => window.open(att.url, "_blank")}
-                >
-                  <ExternalLink className="w-8 h-8 mb-2" />
-                  <span className="text-xs font-medium">点击查看视频</span>
-                </div>
-              ) : null}
-            </React.Fragment>
-          ))}
+        <div className="flex flex-wrap gap-2 mt-1">
+          {attachments.map((att, i) => renderAttachment(att, i))}
         </div>
+      )}
+      {!mainContent && (!attachments || attachments.length === 0) && (
+        <div className="text-[14px] opacity-60 px-1">{trimmedContent || "[空消息]"}</div>
       )}
     </div>
   );
@@ -341,6 +552,9 @@ const ChatViewer: React.FC<ChatViewerProps> = ({ group, onBack }) => {
   const [userQuery, setUserQuery] = useState("");
   const [users, setUsers] = useState<ChatUserSummary[]>([]);
   const [loadingUsers, setLoadingUsers] = useState(false);
+  const [loadingMoreUsers, setLoadingMoreUsers] = useState(false);
+  const [usersHasMore, setUsersHasMore] = useState(false);
+  const [usersNextOffset, setUsersNextOffset] = useState<number | null>(null);
   const [activeSenderId, setActiveSenderId] = useState<string | null>(null);
   const [activeSenderName, setActiveSenderName] = useState<string | null>(null);
   const avatarFillInFlight = useRef<Set<string>>(new Set());
@@ -348,6 +562,14 @@ const ChatViewer: React.FC<ChatViewerProps> = ({ group, onBack }) => {
   const userListScrollRef = useRef<HTMLDivElement>(null);
   const usersRef = useRef(users);
   usersRef.current = users;
+  const usersHasMoreRef = useRef(usersHasMore);
+  usersHasMoreRef.current = usersHasMore;
+  const usersNextOffsetRef = useRef(usersNextOffset);
+  usersNextOffsetRef.current = usersNextOffset;
+  const loadingMoreUsersRef = useRef(false);
+  const lastUserQueryRef = useRef("");
+
+  const USER_PAGE_SIZE = 500;
 
   const fillAvatarIfNeeded = useCallback(
     async (senderId: string) => {
@@ -371,7 +593,6 @@ const ChatViewer: React.FC<ChatViewerProps> = ({ group, onBack }) => {
                   ...u,
                   avatarUrl: updated.avatarUrl || u.avatarUrl,
                   screenName: updated.screenName || u.screenName,
-                  messageCount: updated.messageCount || u.messageCount,
                 }
               : u
           )
@@ -546,18 +767,51 @@ const ChatViewer: React.FC<ChatViewerProps> = ({ group, onBack }) => {
     }
   };
 
-  const loadUsers = async (q?: string) => {
-    setLoadingUsers(true);
-    avatarFillTried.current.clear();
-    avatarFillInFlight.current.clear();
+  const loadUsers = async (q?: string, reset = true) => {
+    const query = (q ?? userQuery).trim();
+    if (reset) {
+      setLoadingUsers(true);
+      avatarFillTried.current.clear();
+      avatarFillInFlight.current.clear();
+      lastUserQueryRef.current = query;
+    } else {
+      if (
+        loadingMoreUsersRef.current ||
+        !usersHasMoreRef.current ||
+        usersNextOffsetRef.current == null
+      ) {
+        return;
+      }
+      loadingMoreUsersRef.current = true;
+      setLoadingMoreUsers(true);
+    }
+
     try {
-      const list = await fetchGroupUsers(group.groupId, q);
-      setUsers(list);
+      const page = await fetchGroupUsers({
+        groupId: group.groupId,
+        q: query || undefined,
+        limit: USER_PAGE_SIZE,
+        offset: reset ? 0 : usersNextOffsetRef.current!,
+      });
+      setUsers((prev) => (reset ? page.users : [...prev, ...page.users]));
+      setUsersHasMore(page.hasMore);
+      setUsersNextOffset(page.nextOffset);
     } catch (e: any) {
       alert(e?.message || "加载成员失败");
     } finally {
-      setLoadingUsers(false);
+      if (reset) setLoadingUsers(false);
+      else {
+        loadingMoreUsersRef.current = false;
+        setLoadingMoreUsers(false);
+      }
     }
+  };
+
+  const onUserListScroll = () => {
+    const el = userListScrollRef.current;
+    if (!el) return;
+    const remain = el.scrollHeight - el.scrollTop - el.clientHeight;
+    if (remain < 80) void loadUsers(lastUserQueryRef.current, false);
   };
 
   // 成员列表可视区域：缺头像的用户进入视口后回填 avatar_url
@@ -586,7 +840,7 @@ const ChatViewer: React.FC<ChatViewerProps> = ({ group, onBack }) => {
     setShowUserPanel(true);
     setShowSearchPanel(false);
     setShowDays(false);
-    if (users.length === 0) await loadUsers();
+    if (users.length === 0) await loadUsers("", true);
   };
 
   const searchByUser = async (user: ChatUserSummary) => {
@@ -718,6 +972,7 @@ const ChatViewer: React.FC<ChatViewerProps> = ({ group, onBack }) => {
       {showUserPanel && (
         <div
           ref={userListScrollRef}
+          onScroll={onUserListScroll}
           className="bg-white border-b border-gray-100 p-4 max-h-80 overflow-y-auto"
         >
           <div className="flex items-center gap-2 mb-3">
@@ -727,14 +982,14 @@ const ChatViewer: React.FC<ChatViewerProps> = ({ group, onBack }) => {
                 value={userQuery}
                 onChange={(e) => setUserQuery(e.target.value)}
                 onKeyDown={(e) => {
-                  if (e.key === "Enter") void loadUsers(userQuery);
+                  if (e.key === "Enter") void loadUsers(userQuery, true);
                 }}
                 placeholder="搜索群成员昵称或 UID..."
                 className="w-full pl-10 pr-4 py-2 bg-gray-50 border border-gray-200 rounded-xl text-sm"
               />
             </div>
             <button
-              onClick={() => void loadUsers(userQuery)}
+              onClick={() => void loadUsers(userQuery, true)}
               className="px-3 py-2 bg-indigo-600 text-white rounded-xl text-sm font-bold"
             >
               {loadingUsers ? <Loader2 className="w-4 h-4 animate-spin" /> : "查找"}
@@ -775,9 +1030,7 @@ const ChatViewer: React.FC<ChatViewerProps> = ({ group, onBack }) => {
                   </div>
                   <div className="min-w-0">
                     <p className="text-sm font-bold text-gray-900 truncate">{u.screenName}</p>
-                    <p className="text-[10px] text-gray-400">
-                      {u.messageCount.toLocaleString()} 条 · {u.senderId}
-                    </p>
+                    <p className="text-[10px] text-gray-400">{u.senderId}</p>
                   </div>
                 </button>
                 <a
@@ -791,6 +1044,14 @@ const ChatViewer: React.FC<ChatViewerProps> = ({ group, onBack }) => {
                 </a>
               </div>
             ))}
+            {loadingMoreUsers && (
+              <div className="flex justify-center py-3 text-gray-400">
+                <Loader2 className="w-4 h-4 animate-spin" />
+              </div>
+            )}
+            {!loadingUsers && !loadingMoreUsers && usersHasMore && (
+              <p className="text-xs text-gray-400 text-center py-2">下滑加载更多</p>
+            )}
             {!loadingUsers && users.length === 0 && (
               <p className="text-sm text-gray-400 text-center py-6">暂无成员数据</p>
             )}

@@ -3,6 +3,7 @@ import type {
   ChatGroupSummary,
   ChatUserSummary,
   GroupStats,
+  GroupUsersPage,
   MessagePage,
   OverallStats,
   SearchPage,
@@ -68,16 +69,19 @@ export async function searchGroupMessages(params: {
   );
 }
 
-export async function fetchGroupUsers(
-  groupId: string,
-  q?: string
-): Promise<ChatUserSummary[]> {
+export async function fetchGroupUsers(params: {
+  groupId: string;
+  q?: string;
+  limit?: number;
+  offset?: number;
+}): Promise<GroupUsersPage> {
   const qs = new URLSearchParams();
-  if (q) qs.set("q", q);
-  const data = await getJson<{ users: ChatUserSummary[] }>(
-    `/api/groups/${encodeURIComponent(groupId)}/users${qs.toString() ? `?${qs}` : ""}`
+  if (params.q) qs.set("q", params.q);
+  if (params.limit != null) qs.set("limit", String(params.limit));
+  if (params.offset != null) qs.set("offset", String(params.offset));
+  return getJson<GroupUsersPage>(
+    `/api/groups/${encodeURIComponent(params.groupId)}/users${qs.toString() ? `?${qs}` : ""}`
   );
-  return data.users || [];
 }
 
 /** 下滑成员列表时：从历史消息回填缺失的 avatar_url */
