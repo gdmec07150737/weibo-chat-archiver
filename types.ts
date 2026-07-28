@@ -1,3 +1,40 @@
+export type MessageMediaType =
+  | 0 // 文字
+  | 1 // 图片
+  | 4 // 语音
+  | 5 // 文件
+  | 9 // 微博图片表情（短链）
+  | 10 // 视频
+  | 11 // 链接
+  | 13 // 红包/主页/站内链接
+  | 14 // 微博链接
+  | 15 // 动画表情
+  | number;
+
+export type MessageAttachmentType =
+  | "image"
+  | "video"
+  | "audio"
+  | "file"
+  | "emoji"
+  | "link"
+  | "weibo_post"
+  | "red_packet"
+  | "system";
+
+export interface MessageAttachment {
+  type: MessageAttachmentType;
+  url?: string;
+  /** 展示用标题/文件名 */
+  title?: string;
+  /** 副标题/摘要 */
+  description?: string;
+  /** 缩略图（微博帖等） */
+  thumb?: string;
+  /** 原始 media_type */
+  mediaType?: number;
+}
+
 export interface WeiboMessage {
   id: string;
   senderName: string;
@@ -5,10 +42,8 @@ export interface WeiboMessage {
   content: string;
   timestamp: string; // ISO format
   avatar?: string;
-  attachments?: {
-    type: string;
-    url: string;
-  }[];
+  mediaType?: MessageMediaType;
+  attachments?: MessageAttachment[];
   msgTimeUnix?: number | null;
   dbId?: number;
 }
@@ -33,8 +68,17 @@ export interface ChatUserSummary {
   senderId: string;
   screenName: string;
   avatarUrl: string | null;
-  messageCount: number;
+  messageCount?: number;
   profileUrl: string;
+}
+
+export interface GroupUsersPage {
+  groupId: string;
+  users: ChatUserSummary[];
+  offset: number;
+  limit: number;
+  hasMore: boolean;
+  nextOffset: number | null;
 }
 
 export interface MessagePage {
@@ -85,8 +129,8 @@ export interface ChatArchive {
 }
 
 export enum ViewState {
-  DASHBOARD = 'DASHBOARD',
-  IMPORT = 'IMPORT',
-  HISTORY = 'HISTORY',
-  ANALYTICS = 'ANALYTICS'
+  DASHBOARD = "DASHBOARD",
+  IMPORT = "IMPORT",
+  HISTORY = "HISTORY",
+  ANALYTICS = "ANALYTICS",
 }
