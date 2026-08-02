@@ -41,7 +41,7 @@ export const generateCollectorScript = (groupId: string = '', appUrl: string = '
     return;
   }
 
-  const mode = prompt("请选择采集模式：\\n1. 备份历史消息 (向上翻页)\\n2. 监控当前消息 (保持最新)", "1");
+  const mode = prompt("请选择采集模式：\\n1. 备份历史消息 (向上翻页)\\n2. 监控当前消息 (保持最新，可补跨日漏抓)", "2");
   const isHistoryMode = mode === "1";
   
   const defaultInterval = isHistoryMode ? "2" : "20";
@@ -87,11 +87,45 @@ export const generateCollectorScript = (groupId: string = '', appUrl: string = '
   let maxMid = "";
   let page = 1;
   const count = 20;
-  // 跨午夜/瞬时网络抖动时，微博接口可能短暂空响应或报错；不要立刻结束
-  const MAX_EMPTY_STREAK = isHistoryMode ? 5 : 0; // 监控模式永不因空页停止
-  const MAX_ERROR_STREAK = 8;
+  // 跨午夜接口可能短暂空响应/报错；监控模式永不因空页结束
+  const MAX_EMPTY_STREAK = isHistoryMode ? 12 : 0;
+  const MAX_ERROR_STREAK = 20;
+  const MAX_CATCHUP_PAGES = 100; // 监控单轮最多往回翻 100 页补洞（约 2000 条）
   let emptyStreak = 0;
   let errorStreak = 0;
+  // 监控模式：库中已有的最新 message_id，用作「补洞」下界
+  let dbNewestMid = "";
+
+  const msgIdOf = (msg) => (msg.mid || msg.id || msg.idstr || "").toString();
+  const msgKeyOf = (msg) => {
+    const id = msgIdOf(msg);
+    const time = (msg.time || "").toString();
+    return id ? id + "_" + time : "";
+  };
+  const midLess = (a, b) => {
+    if (!a) return false;
+    if (!b) return true;
+    if (a.length !== b.length) return a.length < b.length;
+    return a < b;
+  };
+  const oldestIdIn = (msgs) => {
+    let oldest = "";
+    for (const m of msgs) {
+      const id = msgIdOf(m);
+      if (!id) continue;
+      if (!oldest || midLess(id, oldest)) oldest = id;
+    }
+    return oldest;
+  };
+  const newestIdIn = (msgs) => {
+    let newest = "";
+    for (const m of msgs) {
+      const id = msgIdOf(m);
+      if (!id) continue;
+      if (!newest || midLess(newest, id)) newest = id;
+    }
+    return newest;
+  };
 
   const updateUI = (status) => {
     const statusEl = document.getElementById('wb-status');
@@ -166,74 +200,125 @@ export const generateCollectorScript = (groupId: string = '', appUrl: string = '
     URL.revokeObjectURL(url);
   };
 
-  // 历史模式：若 MySQL 已有数据，可从最旧消息继续往更早翻页
-  if (isHistoryMode) {
-    try {
-      updateUI("正在检查 MySQL 进度...");
-      const progressRes = await fetch(\`\${appUrl}/api/progress?groupId=\${encodeURIComponent(groupId)}\`, { mode: 'cors' });
-      if (progressRes.ok) {
-        const progress = await progressRes.json();
-        if (progress.count > 0 && progress.oldestMessageId) {
-          const resume = confirm(
-            \`检测到该群在 MySQL 已有 \${progress.count} 条消息。\\n\\n是否从最旧消息继续往更早抓取（断点续采）？\\n\\n点击「确定」续采；「取消」则从头开始。\`
-          );
-          if (resume) {
-            maxMid = String(progress.oldestMessageId);
-            uploadedCount = Number(progress.count) || 0;
-            console.log(\`[采集器] 断点续采，从 max_mid=\${maxMid} 继续，库中已有 \${uploadedCount} 条\`);
-            updateUI(\`断点续采：从已有 \${uploadedCount} 条继续\`);
-          }
-        }
+  /**
+   * 构造请求 URL。
+   * t=Date.now() 只是防缓存随机数（毫秒时间戳），跨日完全正常，不是停抓原因。
+   * max_mid：取比它更早的消息（历史翻页 / 监控补洞往回翻）。
+   */
+  const buildQueryUrl = (pageMaxMid) => {
+    const t = Date.now();
+    let url = \`https://api.weibo.com/webim/groupchat/query_messages.json?convert_emoji=1&query_sender=1&count=\${count}&id=\${groupId}&source=209678993&t=\${t}\`;
+    if (pageMaxMid) url += \`&max_mid=\${pageMaxMid}\`;
+    return url;
+  };
+
+  const fetchPage = async (pageMaxMid) => {
+    const url = buildQueryUrl(pageMaxMid);
+    const response = await fetch(url, { credentials: "include" });
+    if (!response.ok) throw new Error("HTTP " + response.status);
+    return response.json();
+  };
+
+  const ingestMessages = async (messages, label, anchorMid) => {
+    const pageNew = [];
+    let hitAnchor = false;
+    let hitSeen = false;
+    for (const msg of messages) {
+      const id = msgIdOf(msg);
+      const key = msgKeyOf(msg);
+      // 锚点用本轮开始时的库最新 mid，补洞过程中不要改它
+      if (anchorMid && id && (id === anchorMid || midLess(id, anchorMid))) {
+        hitAnchor = true;
       }
-    } catch (progressErr) {
-      console.warn("[采集器] 读取进度失败，将从头抓取:", progressErr.message || progressErr);
+      if (key && seenKeys.has(key)) hitSeen = true;
+      if (id && key && !seenKeys.has(key)) {
+        // 只入库比锚点更新的消息，避免把历史又扫一遍
+        if (anchorMid && (id === anchorMid || midLess(id, anchorMid))) {
+          seenKeys.add(key);
+          continue;
+        }
+        seenKeys.add(key);
+        pageNew.push(msg);
+        sessionSeenCount++;
+      }
     }
+    if (pageNew.length > 0) {
+      const ok = await flushToServer(pageNew, label);
+      if (!ok) {
+        pendingMessages.push(...pageNew);
+        console.warn(\`[采集器] \${label} 入库失败，已加入待重试（\${pendingMessages.length}）\`);
+      }
+    }
+    return { pageNew, hitAnchor, hitSeen };
+  };
+
+  // 读取 MySQL 进度：历史断点用 oldest；监控补洞用 newest
+  try {
+    updateUI("正在检查 MySQL 进度...");
+    const progressRes = await fetch(\`\${appUrl}/api/progress?groupId=\${encodeURIComponent(groupId)}\`, { mode: 'cors' });
+    if (progressRes.ok) {
+      const progress = await progressRes.json();
+      uploadedCount = Number(progress.count) || 0;
+      if (progress.newestMessageId) {
+        dbNewestMid = String(progress.newestMessageId);
+      }
+      if (isHistoryMode && progress.count > 0 && progress.oldestMessageId) {
+        const resume = confirm(
+          \`检测到该群在 MySQL 已有 \${progress.count} 条消息。\\n\\n是否从最旧消息继续往更早抓取（断点续采）？\\n\\n点击「确定」续采；「取消」则从最新往旧翻。\\n\\n注意：历史模式只往更早抓，跨日后的新消息请用「监控模式」。\`
+        );
+        if (resume) {
+          maxMid = String(progress.oldestMessageId);
+          console.log(\`[采集器] 断点续采，从 max_mid=\${maxMid} 继续，库中已有 \${uploadedCount} 条\`);
+          updateUI(\`断点续采：从已有 \${uploadedCount} 条继续\`);
+        }
+      } else if (!isHistoryMode && dbNewestMid) {
+        console.log(\`[采集器] 监控模式将从库最新 mid=\${dbNewestMid} 往回补洞到最新\`);
+        updateUI(\`监控就绪：将补齐库最新之后的消息\`);
+      }
+    }
+  } catch (progressErr) {
+    console.warn("[采集器] 读取进度失败:", progressErr.message || progressErr);
   }
 
   try {
     while (running) {
-      updateUI(\`正在抓取第 \${page} 页...\`);
-      console.log(\`[采集器] 正在请求第 \${page} 页, max_mid: \${maxMid || '无'}\`);
+      if (isHistoryMode) {
+        updateUI(\`历史抓取第 \${page} 页...\`);
+        console.log(\`[采集器] 历史第 \${page} 页, max_mid: \${maxMid || '无'}\`);
 
-      let data = null;
-      try {
-        const url = \`https://api.weibo.com/webim/groupchat/query_messages.json?convert_emoji=1&query_sender=1&count=\${count}&id=\${groupId}\${(isHistoryMode && maxMid) ? "&max_mid=" + maxMid : ""}&source=209678993&t=\${Date.now()}\`;
-        const response = await fetch(url, { credentials: "include" });
-        if (!response.ok) {
-          throw new Error("HTTP " + response.status);
+        let data = null;
+        try {
+          data = await fetchPage(maxMid || "");
+        } catch (fetchErr) {
+          errorStreak++;
+          console.warn(\`[采集器] 请求异常 (\${errorStreak}/\${MAX_ERROR_STREAK}):\`, fetchErr.message || fetchErr);
+          updateUI(\`请求异常，\${Math.min(60, 3 * errorStreak)} 秒后重试...\`);
+          if (errorStreak >= MAX_ERROR_STREAK) {
+            updateUI("连续请求失败过多，已暂停（可重新开书签续采）");
+            break;
+          }
+          await sleep(Math.min(60000, 3000 * errorStreak));
+          continue;
         }
-        data = await response.json();
-      } catch (fetchErr) {
-        errorStreak++;
-        console.warn(\`[采集器] 请求异常 (\${errorStreak}/\${MAX_ERROR_STREAK}):\`, fetchErr.message || fetchErr);
-        updateUI(\`请求异常，\${Math.min(30, 3 * errorStreak)} 秒后重试...\`);
-        if (errorStreak >= MAX_ERROR_STREAK) {
-          updateUI("连续请求失败过多，已暂停（可点停止后重新开书签续采）");
-          break;
+
+        if (data.error || data.error_code) {
+          errorStreak++;
+          console.warn("[采集器] 微博接口返回错误:", data);
+          updateUI(\`接口错误(\${data.error || data.error_code})，稍后重试...\`);
+          if (errorStreak >= MAX_ERROR_STREAK) {
+            updateUI(\`连续接口错误过多: \${data.error || data.error_code}\`);
+            break;
+          }
+          await sleep(Math.min(60000, 3000 * errorStreak));
+          continue;
         }
-        await sleep(Math.min(30000, 3000 * errorStreak));
-        continue;
-      }
 
-      if (data.error || data.error_code) {
-        errorStreak++;
-        console.warn("[采集器] 微博接口返回错误:", data);
-        updateUI(\`接口错误(\${data.error || data.error_code})，稍后重试...\`);
-        if (errorStreak >= MAX_ERROR_STREAK) {
-          updateUI(\`连续接口错误过多: \${data.error || data.error_code}\`);
-          break;
-        }
-        await sleep(Math.min(30000, 3000 * errorStreak));
-        continue;
-      }
+        errorStreak = 0;
+        const messages = data.messages || [];
+        console.log(\`[采集器] 本页抓取到 \${messages.length} 条消息\`);
 
-      errorStreak = 0;
-      const messages = data.messages || [];
-      console.log(\`[采集器] 本页抓取到 \${messages.length} 条消息\`);
-
-      if (messages.length === 0) {
-        emptyStreak++;
-        if (isHistoryMode) {
+        if (messages.length === 0) {
+          emptyStreak++;
           console.warn(\`[采集器] 空页 (\${emptyStreak}/\${MAX_EMPTY_STREAK})，可能是跨午夜瞬时空响应\`);
           updateUI(\`空页重试 \${emptyStreak}/\${MAX_EMPTY_STREAK}...\`);
           if (emptyStreak >= MAX_EMPTY_STREAK) {
@@ -242,72 +327,140 @@ export const generateCollectorScript = (groupId: string = '', appUrl: string = '
           }
           await sleep(Math.min(20000, 2000 * emptyStreak));
           continue;
-        } else {
-          console.log("[采集器] 暂无新消息");
-          emptyStreak = 0;
         }
-      } else {
+
         emptyStreak = 0;
-        const pageNew = [];
-        messages.forEach(msg => {
-          const id = (msg.id || msg.mid || msg.idstr || "").toString();
-          const time = (msg.time || "").toString();
-          const key = \`\${id}_\${time}\`;
-          if (id && !seenKeys.has(key)) {
-            seenKeys.add(key);
-            pageNew.push(msg);
-            sessionSeenCount++;
-          }
-        });
+        const { pageNew } = await ingestMessages(messages, \`历史第 \${page} 页\`, "");
+        updateUI(pageNew.length ? \`历史第 \${page} 页已处理\` : \`历史第 \${page} 页无新增\`);
 
-        console.log(\`[采集器] 本页新增 \${pageNew.length} 条唯一消息\`);
-
-        // 每页立刻写入 MySQL；成功后不保留正文，只留去重 key
-        if (pageNew.length > 0) {
-          const ok = await flushToServer(pageNew, \`第 \${page} 页\`);
-          if (!ok) {
-            pendingMessages.push(...pageNew);
-            console.warn(\`[采集器] 第 \${page} 页入库失败，已加入待重试队列（\${pendingMessages.length} 条）\`);
+        const nextCursor = oldestIdIn(messages);
+        console.log(\`[采集器] 下一页游标 (max_mid): \${nextCursor}\`);
+        if (!nextCursor || nextCursor === maxMid) {
+          if (pageNew.length === 0) {
+            emptyStreak++;
+            if (emptyStreak >= MAX_EMPTY_STREAK) {
+              updateUI("游标不再推进，历史抓取结束");
+              break;
+            }
           }
-          updateUI(ok ? \`第 \${page} 页已入库\` : \`第 \${page} 页入库失败，已排队重试\`);
+        } else {
+          maxMid = nextCursor;
         }
 
-        if (isHistoryMode) {
-          // 自动识别最旧的消息 ID 作为下一页的游标
-          let oldestMsg = messages[0];
-          for (let i = 1; i < messages.length; i++) {
-            const currentId = (messages[i].mid || messages[i].id || "").toString();
-            const oldestId = (oldestMsg.mid || oldestMsg.id || "").toString();
-            // 比较 ID 长度和值，ID 越小通常越旧
-            if (currentId.length < oldestId.length || (currentId.length === oldestId.length && currentId < oldestId)) {
-              oldestMsg = messages[i];
-            }
-          }
+        if (!running) break;
+        await sleep(interval);
+        page++;
+        continue;
+      }
 
-          const nextCursor = (oldestMsg.mid || oldestMsg.id || oldestMsg.idstr || "").toString();
-          console.log(\`[采集器] 下一页游标 (max_mid): \${nextCursor}\`);
+      // ========== 监控模式：每轮从最新往回翻，直到碰到库里已有的 newest，补上跨日/漏网消息 ==========
+      updateUI("监控：拉取最新并补洞...");
+      // 锚点固定为本轮开始时的库最新 mid，补洞中途绝不能被新消息覆盖
+      const anchorMid = dbNewestMid;
+      let catchMaxMid = "";
+      let catchPage = 0;
+      let caughtUp = false;
+      let cycleNewest = "";
 
-          if (!nextCursor || nextCursor === maxMid) {
-            console.log("[采集器] 游标未变化或无效");
-            // 本页全是重复且游标不变 → 可能到头；再给几次空/重复机会
-            if (pageNew.length === 0) {
-              emptyStreak++;
-              if (emptyStreak >= MAX_EMPTY_STREAK) {
-                updateUI("游标不再推进，历史抓取结束");
-                break;
-              }
-            }
+      while (running && catchPage < MAX_CATCHUP_PAGES && !caughtUp) {
+        catchPage++;
+        page++;
+        console.log(\`[采集器] 监控补洞第 \${catchPage} 页, max_mid: \${catchMaxMid || '无'}, 锚点: \${anchorMid || '无'}\`);
+
+        let data = null;
+        try {
+          data = await fetchPage(catchMaxMid || "");
+        } catch (fetchErr) {
+          errorStreak++;
+          console.warn(\`[采集器] 监控请求异常 (\${errorStreak}/\${MAX_ERROR_STREAK}):\`, fetchErr.message || fetchErr);
+          updateUI(\`请求异常，\${Math.min(60, 3 * errorStreak)} 秒后重试...\`);
+          if (errorStreak >= MAX_ERROR_STREAK) {
+            // 监控模式：不退出，拉长等待后清零再试（跨午夜常见）
+            updateUI("连续失败，60 秒后继续监控...");
+            await sleep(60000);
+            errorStreak = 0;
           } else {
-            maxMid = nextCursor;
+            await sleep(Math.min(60000, 3000 * errorStreak));
           }
+          continue;
         }
+
+        if (data.error || data.error_code) {
+          errorStreak++;
+          console.warn("[采集器] 监控接口错误:", data);
+          updateUI(\`接口错误(\${data.error || data.error_code})，稍后重试...\`);
+          if (errorStreak >= MAX_ERROR_STREAK) {
+            updateUI("连续接口错误，60 秒后继续监控...");
+            await sleep(60000);
+            errorStreak = 0;
+          } else {
+            await sleep(Math.min(60000, 3000 * errorStreak));
+          }
+          continue;
+        }
+
+        errorStreak = 0;
+        const messages = data.messages || [];
+        console.log(\`[采集器] 监控本页 \${messages.length} 条\`);
+
+        if (messages.length === 0) {
+          console.log("[采集器] 暂无消息，本轮补洞结束");
+          caughtUp = true;
+          break;
+        }
+
+        const newest = newestIdIn(messages);
+        if (newest && (!cycleNewest || midLess(cycleNewest, newest))) cycleNewest = newest;
+
+        const { pageNew, hitAnchor, hitSeen } = await ingestMessages(
+          messages,
+          \`监控补洞 \${catchPage}\`,
+          anchorMid
+        );
+        updateUI(
+          pageNew.length
+            ? \`监控补洞：本页新增 \${pageNew.length} 条\`
+            : \`监控：已对齐，等待新消息...\`
+        );
+
+        // 碰到锚点（库里原来的 newest 或更旧），或本页部分已见 → 补洞完成
+        if (hitAnchor || (hitSeen && pageNew.length < messages.length)) {
+          caughtUp = true;
+          break;
+        }
+        // 没有锚点（库空）且本页无新增 → 停止往回翻
+        if (!anchorMid && pageNew.length === 0) {
+          caughtUp = true;
+          break;
+        }
+        // 库空首轮：只取最新一页，后续靠轮询；避免监控变成全量历史
+        if (!anchorMid && catchPage === 1) {
+          caughtUp = true;
+          break;
+        }
+        // 有锚点但本页无新增（已对齐）
+        if (anchorMid && pageNew.length === 0) {
+          caughtUp = true;
+          break;
+        }
+
+        const older = oldestIdIn(messages);
+        if (!older || older === catchMaxMid) {
+          caughtUp = true;
+          break;
+        }
+        catchMaxMid = older;
+        await sleep(Math.min(interval, 1500));
+      }
+
+      if (cycleNewest && (!dbNewestMid || midLess(dbNewestMid, cycleNewest))) {
+        dbNewestMid = cycleNewest;
       }
 
       if (!running) break;
-
-      console.log(\`[采集器] 等待 \${interval/1000} 秒后继续...\`);
+      console.log(\`[采集器] 监控等待 \${interval/1000} 秒（最新 mid=\${dbNewestMid || '无'}）...\`);
+      updateUI(\`监控待命中（\${interval/1000}s）...\`);
       await sleep(interval);
-      page++;
     }
 
     // 停止/结束后：重试待入库消息
@@ -320,16 +473,20 @@ export const generateCollectorScript = (groupId: string = '', appUrl: string = '
       }
     }
 
-    if (uploadedCount === 0 && pendingMessages.length === 0) {
+    if (uploadedCount === 0 && pendingMessages.length === 0 && sessionSeenCount === 0) {
       alert("未抓取到任何消息，操作取消。");
       controlDiv.remove();
       return;
     }
 
     if (pendingMessages.length === 0) {
-      updateUI("全部已写入 MySQL");
+      updateUI(isHistoryMode ? "历史抓取结束，已写入 MySQL" : "监控已停止，数据已写入 MySQL");
       setTimeout(() => {
-        alert(\`采集完成！\\n本轮见到 \${sessionSeenCount} 条\\n累计已入库约 \${uploadedCount} 条（含此前断点）\\n\\n中途挂掉也不怕：已写入的数据都在 MySQL，下次可断点续采。\`);
+        alert(
+          isHistoryMode
+            ? \`历史采集结束！\\n本轮见到 \${sessionSeenCount} 条\\n累计已入库约 \${uploadedCount} 条\\n\\n跨日新消息请再用「监控模式」运行。\`
+            : \`监控已停止。\\n本轮见到 \${sessionSeenCount} 条\\n累计已入库约 \${uploadedCount} 条\`
+        );
         controlDiv.remove();
       }, 500);
       return;
@@ -350,7 +507,6 @@ export const generateCollectorScript = (groupId: string = '', appUrl: string = '
     }, 500);
   } catch (err) {
     console.error("[采集器] 采集失败:", err);
-    // 异常时尽量保住待入库数据
     if (pendingMessages.length > 0) {
       try {
         const dateGroups = groupByDate(pendingMessages);
@@ -365,3 +521,4 @@ export const generateCollectorScript = (groupId: string = '', appUrl: string = '
 })();
   `.trim();
 };
+
