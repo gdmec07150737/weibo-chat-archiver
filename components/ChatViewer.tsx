@@ -16,6 +16,7 @@ import {
   Film,
   Gift,
   Link2,
+  X,
 } from "lucide-react";
 import { format, isToday, isYesterday, isSameDay } from "date-fns";
 import type {
@@ -46,6 +47,151 @@ function weiboProfileUrl(senderId?: string): string | null {
   if (!senderId || !/^\d+$/.test(senderId)) return null;
   return `https://weibo.com/u/${senderId}`;
 }
+
+/** 可拖动、右下角可调大小的浮动弹窗 */
+const ResizableFloatingPanel: React.FC<{
+  title: React.ReactNode;
+  onClose: () => void;
+  children: React.ReactNode;
+  bodyRef?: React.RefObject<HTMLDivElement | null>;
+  onBodyScroll?: () => void;
+  initialWidth?: number;
+  initialHeight?: number;
+  minWidth?: number;
+  minHeight?: number;
+}> = ({
+  title,
+  onClose,
+  children,
+  bodyRef,
+  onBodyScroll,
+  initialWidth = 440,
+  initialHeight = 520,
+  minWidth = 320,
+  minHeight = 260,
+}) => {
+  const [size, setSize] = useState({ w: initialWidth, h: initialHeight });
+  const [pos, setPos] = useState(() => ({
+    x: Math.max(24, window.innerWidth - initialWidth - 24),
+    y: 88,
+  }));
+  const dragRef = useRef<{
+    mode: "move" | "resize";
+    startX: number;
+    startY: number;
+    origX: number;
+    origY: number;
+    origW: number;
+    origH: number;
+  } | null>(null);
+
+  useEffect(() => {
+    const onMove = (e: PointerEvent) => {
+      const d = dragRef.current;
+      if (!d) return;
+      if (d.mode === "move") {
+        const nx = Math.min(
+          Math.max(0, d.origX + e.clientX - d.startX),
+          window.innerWidth - 80
+        );
+        const ny = Math.min(
+          Math.max(0, d.origY + e.clientY - d.startY),
+          window.innerHeight - 48
+        );
+        setPos({ x: nx, y: ny });
+      } else {
+        const nw = Math.min(
+          Math.max(minWidth, d.origW + e.clientX - d.startX),
+          window.innerWidth - 8
+        );
+        const nh = Math.min(
+          Math.max(minHeight, d.origH + e.clientY - d.startY),
+          window.innerHeight - 8
+        );
+        setSize({ w: nw, h: nh });
+      }
+    };
+    const onUp = () => {
+      dragRef.current = null;
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    return () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+    };
+  }, [minWidth, minHeight]);
+
+  const startMove = (e: React.PointerEvent) => {
+    if ((e.target as HTMLElement).closest("button,a,input")) return;
+    dragRef.current = {
+      mode: "move",
+      startX: e.clientX,
+      startY: e.clientY,
+      origX: pos.x,
+      origY: pos.y,
+      origW: size.w,
+      origH: size.h,
+    };
+  };
+
+  const startResize = (e: React.PointerEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    dragRef.current = {
+      mode: "resize",
+      startX: e.clientX,
+      startY: e.clientY,
+      origX: pos.x,
+      origY: pos.y,
+      origW: size.w,
+      origH: size.h,
+    };
+  };
+
+  return (
+    <div
+      className="fixed z-[80] flex flex-col bg-white rounded-2xl border border-gray-200 shadow-2xl overflow-hidden"
+      style={{
+        left: pos.x,
+        top: pos.y,
+        width: size.w,
+        height: size.h,
+      }}
+    >
+      <div
+        onPointerDown={startMove}
+        className="flex items-center justify-between gap-2 px-4 py-3 border-b border-gray-100 bg-gray-50 cursor-grab active:cursor-grabbing select-none flex-shrink-0"
+      >
+        <div className="min-w-0 text-sm font-bold text-gray-900 truncate">{title}</div>
+        <button
+          type="button"
+          onClick={onClose}
+          className="p-1.5 rounded-lg text-gray-400 hover:text-gray-700 hover:bg-gray-200/80"
+          title="关闭"
+        >
+          <X className="w-4 h-4" />
+        </button>
+      </div>
+      <div
+        ref={bodyRef as React.RefObject<HTMLDivElement>}
+        onScroll={onBodyScroll}
+        className="flex-1 min-h-0 overflow-y-auto p-4"
+      >
+        {children}
+      </div>
+      <div
+        onPointerDown={startResize}
+        className="absolute right-0 bottom-0 w-4 h-4 cursor-se-resize"
+        title="拖动调整大小"
+        style={{
+          background:
+            "linear-gradient(135deg, transparent 50%, rgb(165 180 252) 50%)",
+        }}
+      />
+    </div>
+  );
+};
 
 const ImageLightbox: React.FC<{ src: string; onClose: () => void }> = ({ src, onClose }) => {
   // 弹窗优先直链；仅 sinaimg 才走本地代理
@@ -872,7 +1018,7 @@ const ChatViewer: React.FC<ChatViewerProps> = ({ group, onBack }) => {
   };
 
   const openAround = async (messageId: string) => {
-    setShowSearchPanel(false);
+    // 浮动结果窗保持打开，方便继续点下一条
     setLoading(true);
     try {
       const page = await fetchMessages({
@@ -959,21 +1105,32 @@ const ChatViewer: React.FC<ChatViewerProps> = ({ group, onBack }) => {
       </div>
 
       {activeSenderName && (
-        <div className="bg-indigo-50 border-b border-indigo-100 px-4 py-2 text-xs text-indigo-800 flex items-center justify-between">
-          <span>
+        <div className="bg-indigo-50 border-b border-indigo-100 px-4 py-2 text-xs text-indigo-800 flex items-center justify-between gap-3">
+          <span className="truncate">
             当前按用户筛选：<b>{activeSenderName}</b>（{activeSenderId}）
           </span>
-          <button onClick={clearUserFilter} className="font-bold text-indigo-600">
-            清除
-          </button>
+          <div className="flex items-center gap-2 flex-shrink-0">
+            <button
+              onClick={() => setShowSearchPanel(true)}
+              className="font-bold text-indigo-600 hover:underline"
+            >
+              打开结果
+            </button>
+            <button onClick={clearUserFilter} className="font-bold text-indigo-600">
+              清除
+            </button>
+          </div>
         </div>
       )}
 
       {showUserPanel && (
-        <div
-          ref={userListScrollRef}
-          onScroll={onUserListScroll}
-          className="bg-white border-b border-gray-100 p-4 max-h-80 overflow-y-auto"
+        <ResizableFloatingPanel
+          title="按用户查找"
+          onClose={() => setShowUserPanel(false)}
+          bodyRef={userListScrollRef}
+          onBodyScroll={onUserListScroll}
+          initialWidth={420}
+          initialHeight={520}
         >
           <div className="flex items-center gap-2 mb-3">
             <div className="relative flex-1">
@@ -993,12 +1150,6 @@ const ChatViewer: React.FC<ChatViewerProps> = ({ group, onBack }) => {
               className="px-3 py-2 bg-indigo-600 text-white rounded-xl text-sm font-bold"
             >
               {loadingUsers ? <Loader2 className="w-4 h-4 animate-spin" /> : "查找"}
-            </button>
-            <button
-              onClick={() => setShowUserPanel(false)}
-              className="px-3 py-2 text-sm text-gray-500"
-            >
-              关闭
             </button>
           </div>
           <div className="space-y-1">
@@ -1056,7 +1207,7 @@ const ChatViewer: React.FC<ChatViewerProps> = ({ group, onBack }) => {
               <p className="text-sm text-gray-400 text-center py-6">暂无成员数据</p>
             )}
           </div>
-        </div>
+        </ResizableFloatingPanel>
       )}
 
       {showDays && (
@@ -1091,27 +1242,43 @@ const ChatViewer: React.FC<ChatViewerProps> = ({ group, onBack }) => {
       )}
 
       {showSearchPanel && (
-        <div className="bg-indigo-50/80 border-b border-indigo-100 p-4 max-h-56 overflow-y-auto">
-          <div className="flex items-center justify-between mb-2">
-            <p className="text-sm font-bold text-indigo-900">
-              搜索结果 {searchResults.length > 0 ? `(${searchResults.length}+)` : ""}
-            </p>
-            <button
-              className="text-xs text-indigo-600 font-semibold"
-              onClick={() => setShowSearchPanel(false)}
-            >
-              关闭
-            </button>
-          </div>
+        <ResizableFloatingPanel
+          title={
+            activeSenderName
+              ? `按用户结果：${activeSenderName}`
+              : `搜索结果${searchResults.length > 0 ? ` (${searchResults.length}+)` : ""}`
+          }
+          onClose={() => setShowSearchPanel(false)}
+          initialWidth={460}
+          initialHeight={560}
+        >
+          {activeSenderName && (
+            <div className="mb-3 text-xs text-indigo-700 bg-indigo-50 rounded-xl px-3 py-2 flex items-center justify-between gap-2">
+              <span className="truncate">
+                筛选用户 <b>{activeSenderName}</b>（{activeSenderId}）
+              </span>
+              <button
+                onClick={clearUserFilter}
+                className="font-bold text-indigo-600 flex-shrink-0"
+              >
+                清除
+              </button>
+            </div>
+          )}
           {searchResults.length === 0 && !searching && (
-            <p className="text-sm text-indigo-400">没有匹配消息</p>
+            <p className="text-sm text-gray-400 text-center py-8">没有匹配消息</p>
+          )}
+          {searching && searchResults.length === 0 && (
+            <div className="flex justify-center py-8 text-indigo-500">
+              <Loader2 className="w-5 h-5 animate-spin" />
+            </div>
           )}
           <div className="space-y-2">
             {searchResults.map((m) => (
               <button
                 key={m.id}
                 onClick={() => void openAround(m.id)}
-                className="w-full text-left p-3 bg-white rounded-xl border border-indigo-100 hover:border-indigo-300"
+                className="w-full text-left p-3 bg-gray-50 rounded-xl border border-gray-100 hover:border-indigo-300 hover:bg-white"
               >
                 <div className="flex items-center justify-between gap-2 mb-1">
                   <span className="text-xs font-bold text-gray-800">{m.senderName}</span>
@@ -1131,10 +1298,10 @@ const ChatViewer: React.FC<ChatViewerProps> = ({ group, onBack }) => {
               onClick={() => void runSearch(false)}
               className="mt-3 w-full py-2 text-sm font-bold text-indigo-700"
             >
-              加载更多结果
+              {searching ? "加载中..." : "加载更多结果"}
             </button>
           )}
-        </div>
+        </ResizableFloatingPanel>
       )}
 
       <div
