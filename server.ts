@@ -46,6 +46,34 @@ async function startServer() {
   });
   app.use(express.json({ limit: "100mb" }));
 
+  // ---------- 本地微博表情资源（scripts/build-emoji-assets.mjs 生成） ----------
+  // emoji-assets/manifest.json: { "[doge]": "fb8365...png" }
+  // 图片按 sha1 命名存放在 emoji-assets/。清单经 API 下发，图片经静态目录托管，
+  // 前端渲染 [xx] 表情时命中即映射为本地图片，避免依赖微博 CDN/防盗链。
+  const EMOJI_DIR = path.join(process.cwd(), "emoji-assets");
+  if (fsSync.existsSync(path.join(EMOJI_DIR, "manifest.json"))) {
+    app.use(
+      "/emoji-assets",
+      express.static(EMOJI_DIR, {
+        maxAge: "30d",
+        immutable: true,
+        index: false,
+      })
+    );
+    app.get("/api/emoji-manifest", (_req, res) => {
+      try {
+        res
+          .type("application/json")
+          .send(fsSync.readFileSync(path.join(EMOJI_DIR, "manifest.json")));
+      } catch (e) {
+        res.status(500).json({ error: "emoji manifest 读取失败" });
+      }
+    });
+    console.log(`[emoji] 本地表情库已挂载（${EMOJI_DIR}）`);
+  } else {
+    console.warn(`[emoji] 未找到 manifest.json，跳过表情本地化（${EMOJI_DIR}）`);
+  }
+
   // ---------- 头像本地磁盘缓存 ----------
   // 微博头像 URL 形如 https://tvaxN.sinaimg.cn/crop.0.0.180.180.180/xxx
   // 策略：缓存命中直接回本地文件；未命中则拉取并落盘；拉取失败且有历史缓存也回本地；
