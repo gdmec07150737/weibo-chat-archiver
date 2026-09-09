@@ -9,6 +9,7 @@ lerna-debug.log*
 
 node_modules
 backups/
+avatar-cache/
 .env
 dist
 dist-ssr
