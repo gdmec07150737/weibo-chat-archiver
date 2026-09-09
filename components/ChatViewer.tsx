@@ -34,6 +34,22 @@ import {
   searchGroupMessages,
 } from "../services/archiveApi";
 import { toProxiedImageUrl } from "../services/imageProxy";
+import {
+  emojiImageFor,
+  ensureEmojiManifestLoaded,
+  subscribeEmojiReady,
+} from "../services/emojiAssets";
+
+/** 表情清单就绪状态：清单到达后触发一次重渲染，把 [表情] 文本换成图片 */
+function useEmojiManifestReady(): boolean {
+  const [ready, setReady] = useState(false);
+  useEffect(() => {
+    const unsub = subscribeEmojiReady(() => setReady(true));
+    ensureEmojiManifestLoaded(); // 幂等触发首次加载
+    return unsub;
+  }, []);
+  return ready;
+}
 
 interface ChatViewerProps {
   group: ChatGroupSummary;
@@ -309,6 +325,7 @@ const MessageContent: React.FC<{
   isMe: boolean;
   onImagePreview: (src: string) => void;
 }> = ({ message, isMe, onImagePreview }) => {
+  useEmojiManifestReady(); // 让消息气泡在本地表情清单就绪后重渲染
   const { content, attachments, mediaType } = message;
   const trimmedContent = (content || "").trim();
   const hidePlaceholderText =
@@ -339,6 +356,20 @@ const MessageContent: React.FC<{
 
       return emojiParts.map((emojiPart, j) => {
         if (emojiPart.match(emojiRegex)) {
+          // 命中本地表情库的 [doge] 等 → 渲染图片；否则原样显示文本（如 [动画表情] 占位 / [/路径] 兜底）
+          const localUrl = emojiImageFor(emojiPart);
+          if (localUrl) {
+            return (
+              <img
+                key={`emoji-${i}-${j}`}
+                src={localUrl}
+                alt={emojiPart}
+                loading="lazy"
+                className="inline-block align-middle mx-0.5"
+                style={{ width: "1.3em", height: "1.3em", objectFit: "contain" }}
+              />
+            );
+          }
           return (
             <span key={`emoji-${i}-${j}`} className="mx-0.5">
               {emojiPart}

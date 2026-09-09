@@ -84,4 +84,24 @@ Node.js 版本：v22.17.1
 用户头像会自动落盘到项目根目录 `avatar-cache/`（按 URL 哈希命名）。加载优先级：**本地缓存 → 在线拉取（成功即落盘）→ 历史本地缓存 → 显示用户名首字**。即使以后微博封了外链或代理失效，已缓存过的头像仍能正常显示。
 
 - 服务每次启动 3 秒后会自动预取 users 表所有头像到本地（并发 3，不阻塞服务，控制台会打印 `avatar prefetch done`）
-- 手动全量预取/刷新：浏览器访问 `https://localhost:5173/api/avatars/prefetch`（加 `?force=1` 强制全部重新下载），返回 `{total, downloaded, cached, failed}` 统计  
+- 手动全量预取/刷新：浏览器访问 `https://localhost:5173/api/avatars/prefetch`（加 `?force=1` 强制全部重新下载），返回 `{total, downloaded, cached, failed}` 统计
+
+### 表情包本地化（防微博改规则 / 断网也能显示）
+
+聊天里常见的 `[doge]`、`[允悲]`、`[二哈]` 等微博内置表情会先下载到本地 `emoji-assets/`，渲染时把 `[xx]` 文本替换成本地图片（图片在服务端静态托管，不依赖微博 CDN / 防盗链 / 外网）。
+
+- **已内置表情**：`emoji-assets/` 下约 731 个表情（经典表情 + 聊天官方面板全套 + 新款表情），含 `manifest.json`（`{ "[doge]": "xxx.png" }`）。对全库消息的短语命中覆盖率约 94%（152607/162517 条含 `[xx]` 的消息可渲染本地图）。
+- **数据来源（按合并优先级）**：
+  1. `emoji-assets/chat-panel-source.json` —— 从微博网页版群聊表情面板抓取的官方映射（339 条，权威，含 [卡皮巴拉]/[柯基]/[流鼻血] 等新款）；
+  2. weiboticons（微博官方 emotions API 全量，~1987 条经典动图）；
+  3. guozaoke / weiboFace / Tlaster / sklme 社区收集的 gist 与 npm 数据。
+- **路径式 token 破解**：微博聊天 API 会把 PUA 私有区字符转成 `[/ee8cbe.png]` 伪路径 token（`eeXXXX` 即 PUA 字符 U+E3XX 的 UTF-8 字节十六进制）。脚本按聊天前端 `convertEmoji` 官方规律还原为 `https://img.t.sinajs.cn/t4/appstyle/expression/emimage/eeXXXX.png` 直链下载，全库 300 种 token（1.3 万次出现）全部可解。
+- **繁体短语别名**：港澳台客户端发的是繁体短语（[哆啦A夢吃驚]/[壞笑]/[偷樂] 等），构建时按内置 T2S 映射表为繁体 key 复用已下载的简体图。
+- 未命中的短语仍原样显示文本，不影响其它功能。已知缺口：`[动画表情]`（media_type=15，独立 GIF 附件，本就走图片渲染）；`[好运连连]`/`[指定能行]` 等已下架季节表情；`[捂脸]`/`[旺柴]`/`[狗头]` 等 WeChat 风格短语；`[/cp]` 无扩展名 token。
+- **重新构建 / 更新表情库**（联网、需本机能连数据库以统计覆盖率）：
+  ```bash
+  node scripts/build-emoji-assets.mjs
+  ```
+  脚本会从上述来源合并「表情名 → 图片地址」映射、只下载数据库实际用到与面板包含的子集（sha1 命名、幂等跳过已存在）、刷新 `manifest.json`，并打印覆盖率和缺失清单（`missing-phrases.json`）。
+- 说明：`emoji-assets/` 属可再生成的派生数据，已在 `.gitignore` 中忽略；若该目录缺失，服务端会打印 `[emoji] 未找到 manifest.json` 并优雅跳过，前端自动回退为纯文本显示。
+- 界面验证：打开任意群聊，`[doge]` 等应以 1.3em 的行内小图标呈现（与普通文字同高），而不是显示 `[doge]` 四个字。
