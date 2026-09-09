@@ -705,7 +705,9 @@ async function attachUserProfiles(items: WeiboMessage[]): Promise<WeiboMessage[]
     if (!u) return m;
     return {
       ...m,
-      avatar: m.avatar || u.avatar_url,
+      // 优先 users 表的规范头像（avatar_hd，已被预取进本地 avatar-cache），
+      // 消息 raw_json 里自带的 profile_image_url 是另一种尺寸、未缓存且常拉取超时
+      avatar: u.avatar_url || m.avatar,
       senderName:
         m.senderName && m.senderName !== "未知用户"
           ? m.senderName
