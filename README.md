@@ -77,4 +77,11 @@ Node.js 版本：v22.17.1
 4. 点击页面提示的 **`Relaunch`** 重启浏览器
 5. 重新打开微博聊天页 `https://api.weibo.com/chat#/chat`，再运行书签
 
-> 补充：也可以在 `chrome://settings/content/localNetworkAccess` 的「允许访问本地网络中的其他设备」里添加 `api.weibo.com`（注意：书签运行在 `api.weibo.com` 页面，只添加 `weibo.com` 无效，Chrome 按精确主机名匹配）。但部分版本该设置不生效，**推荐直接用上面的 flags 方法**。  
+> 补充：也可以在 `chrome://settings/content/localNetworkAccess` 的「允许访问本地网络中的其他设备」里添加 `api.weibo.com`（注意：书签运行在 `api.weibo.com` 页面，只添加 `weibo.com` 无效，Chrome 按精确主机名匹配）。但部分版本该设置不生效，**推荐直接用上面的 flags 方法**。
+
+### 头像本地缓存（防微博改规则）
+
+用户头像会自动落盘到项目根目录 `avatar-cache/`（按 URL 哈希命名）。加载优先级：**本地缓存 → 在线拉取（成功即落盘）→ 历史本地缓存 → 显示用户名首字**。即使以后微博封了外链或代理失效，已缓存过的头像仍能正常显示。
+
+- 服务每次启动 3 秒后会自动预取 users 表所有头像到本地（并发 3，不阻塞服务，控制台会打印 `avatar prefetch done`）
+- 手动全量预取/刷新：浏览器访问 `https://localhost:5173/api/avatars/prefetch`（加 `?force=1` 强制全部重新下载），返回 `{total, downloaded, cached, failed}` 统计  

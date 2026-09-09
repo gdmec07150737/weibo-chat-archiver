@@ -779,14 +779,31 @@ export async function listGroupUsers(
 }
 
 /**
+ * 列出所有用户的头像 URL（供服务端启动时预下载头像到本地缓存）。
+ */
+export async function listAllAvatarUrls(): Promise<
+  { senderId: string; avatarUrl: string }[]
+> {
+  const db = getPool();
+  const [rows] = await db.query<mysql.RowDataPacket[]>(
+    `SELECT CAST(sender_id AS CHAR) AS senderId, avatar_url AS avatarUrl
+     FROM users
+     WHERE sender_id > 0 AND avatar_url IS NOT NULL AND avatar_url <> ''`
+  );
+  return rows.map((r) => ({
+    senderId: String(r.senderId),
+    avatarUrl: String(r.avatarUrl),
+  }));
+}
+
+/**
  * 从该用户近期消息 raw_json 回填 users.avatar_url（及缺失昵称）。
  * 仅在 avatar 为空时写入，供成员列表下滑懒加载。
  */
 export async function fillUserAvatarFromMessages(
   groupId: string,
   senderId: string
-): Promise<ChatUserSummary | null> {
-  if (!isNumericSenderId(senderId)) return null;
+): Promise<ChatUserSummary | null> {  if (!isNumericSenderId(senderId)) return null;
   const db = getPool();
   const sid = String(senderId);
 

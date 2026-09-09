@@ -3,6 +3,7 @@ import {
   getGroupProgress,
   getGroupStats,
   getOverallStats,
+  listAllAvatarUrls,
   listArchives,
   listGroupDays,
   listGroupUsers,
@@ -17,6 +18,7 @@ import {
 import express from "express";
 import { createServer as createViteServer } from "vite";
 import https from "node:https";
+import crypto from "node:crypto";
 import fsSync from "node:fs";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -44,6 +46,117 @@ async function startServer() {
   });
   app.use(express.json({ limit: "100mb" }));
 
+  // ---------- 头像本地磁盘缓存 ----------
+  // 微博头像 URL 形如 https://tvaxN.sinaimg.cn/crop.0.0.180.180.180/xxx
+  // 策略：缓存命中直接回本地文件；未命中则拉取并落盘；拉取失败且有历史缓存也回本地；
+  //       都没有才返回 502（前端 MessageAvatar onError 回退显示用户名首字）。
+  const AVATAR_CACHE_DIR = path.join(process.cwd(), "avatar-cache");
+  const AVATAR_PATH_RE = /\/crop\./i;
+  const IMG_MIME_EXT: Record<string, string> = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+  };
+
+  const detectImgMime = (buf: Buffer): string => {
+    if (buf.length > 3 && buf[0] === 0xff && buf[1] === 0xd8) return "image/jpeg";
+    if (buf.length > 4 && buf[0] === 0x89 && buf[1] === 0x50) return "image/png";
+    if (buf.length > 3 && buf.toString("ascii", 0, 3) === "GIF") return "image/gif";
+    if (
+      buf.length > 12 &&
+      buf.toString("ascii", 0, 4) === "RIFF" &&
+      buf.toString("ascii", 8, 12) === "WEBP"
+    )
+      return "image/webp";
+    return "image/jpeg";
+  };
+
+  const avatarUrlHash = (url: string) =>
+    crypto.createHash("sha1").update(url).digest("hex");
+
+  const findCachedAvatar = (url: string): string | null => {
+    if (!fsSync.existsSync(AVATAR_CACHE_DIR)) return null;
+    const hash = avatarUrlHash(url);
+    for (const ext of [".jpg", ".png", ".gif", ".webp"]) {
+      const file = path.join(AVATAR_CACHE_DIR, hash + ext);
+      if (fsSync.existsSync(file)) return file;
+    }
+    return null;
+  };
+
+  const downloadAvatarToCache = async (url: string): Promise<string | null> => {
+    const headers = {
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+      Accept: "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+    };
+    for (const referer of ["https://weibo.com/", "https://photo.weibo.com/"]) {
+      try {
+        const resp = await fetch(url, {
+          headers: { ...headers, Referer: referer },
+          redirect: "follow",
+          signal: AbortSignal.timeout(8000),
+        });
+        if (!resp.ok) continue;
+        const buf = Buffer.from(await resp.arrayBuffer());
+        if (buf.length < 100) continue; // 防空图/占位图
+        fsSync.mkdirSync(AVATAR_CACHE_DIR, { recursive: true });
+        const mime = detectImgMime(buf);
+        const file = path.join(
+          AVATAR_CACHE_DIR,
+          avatarUrlHash(url) + (IMG_MIME_EXT[mime] || ".jpg")
+        );
+        const tmp = file + ".tmp";
+        fsSync.writeFileSync(tmp, buf);
+        fsSync.renameSync(tmp, file);
+        return file;
+      } catch {
+        // 换下一个 Referer 重试
+      }
+    }
+    return null;
+  };
+
+  const sendAvatarFile = (res: express.Response, file: string) => {
+    const buf = fsSync.readFileSync(file);
+    res.setHeader("Content-Type", detectImgMime(buf));
+    res.setHeader("Cache-Control", "public, max-age=604800");
+    res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
+    res.send(buf);
+  };
+
+  const prefetchAllAvatars = async (force = false) => {
+    const rows = await listAllAvatarUrls();
+    let downloaded = 0;
+    let cached = 0;
+    let failed = 0;
+    const queue = [...rows];
+    const worker = async () => {
+      while (queue.length) {
+        const row = queue.shift()!;
+        if (!force && findCachedAvatar(row.avatarUrl)) {
+          cached++;
+          continue;
+        }
+        if (await downloadAvatarToCache(row.avatarUrl)) downloaded++;
+        else failed++;
+      }
+    };
+    await Promise.all(Array.from({ length: 3 }, () => worker()));
+    return { total: rows.length, downloaded, cached, failed };
+  };
+
+  // 手动预取/刷新：GET /api/avatars/prefetch（?force=1 强制重新下载全部）
+  app.get("/api/avatars/prefetch", async (req, res) => {
+    try {
+      const result = await prefetchAllAvatars(req.query.force === "1");
+      res.json(result);
+    } catch (e: any) {
+      res.status(500).json({ error: e?.message || String(e) });
+    }
+  });
+
   // 微博头像/图片防盗链代理：浏览器直链 sinaimg 会 403
   app.get("/api/img-proxy", async (req, res) => {
     try {
@@ -59,6 +172,22 @@ async function startServer() {
 
       if (!isAllowedProxyTarget(target.toString())) {
         return res.status(403).send("Host not allowed");
+      }
+
+      // 头像：本地缓存优先，拉取成功即落盘（见上方「头像本地磁盘缓存」）
+      if (AVATAR_PATH_RE.test(target.pathname)) {
+        const cached = findCachedAvatar(target.toString());
+        if (cached) {
+          sendAvatarFile(res, cached);
+          return;
+        }
+        const file = await downloadAvatarToCache(target.toString());
+        if (file) {
+          sendAvatarFile(res, file);
+          return;
+        }
+        console.warn(`avatar unavailable (no cache, fetch failed): ${target.hostname}`);
+        return res.status(502).send("Avatar unavailable");
       }
 
       const referers = [
@@ -432,6 +561,17 @@ async function startServer() {
 
   https.createServer(httpsOptions, app).listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on https://localhost:${PORT}`);
+
+    // 启动后异步预取所有用户头像到本地缓存（不阻塞服务；失败仅告警）
+    setTimeout(() => {
+      prefetchAllAvatars()
+        .then((r) =>
+          console.log(
+            `avatar prefetch done: total=${r.total}, downloaded=${r.downloaded}, cached=${r.cached}, failed=${r.failed}`
+          )
+        )
+        .catch((e) => console.warn("avatar prefetch failed:", e?.message || e));
+    }, 3000);
   });
 }
 
