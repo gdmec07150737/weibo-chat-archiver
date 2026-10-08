@@ -51,6 +51,55 @@ function useEmojiManifestReady(): boolean {
   return ready;
 }
 
+/**
+ * media_type=9 短链 GIF 表情。
+ * 服务端代理（weibo-compic / img-proxy）失败时（如 WSL 出站网络不通），
+ * 降级为 iframe 直接嵌入 photo.weibo.com 原页面：iframe 内图片的 Referer 是
+ * 合法的 weibo 域，由用户浏览器自行加载，完全绕开服务端网络。
+ */
+function Type9EmojiMedia({
+  pageUrl,
+  gifUrl,
+  title,
+  onPreview,
+}: {
+  pageUrl: string;
+  gifUrl: string | null;
+  title: string;
+  onPreview: (src: string) => void;
+}) {
+  const [iframeMode, setIframeMode] = useState(false);
+  // 恒走 weibo-compic：服务端有 wx1/wx2/wx4 多候选直链 + gif-cache 落盘（成功一次永久本地化）
+  const proxySrc = `/api/weibo-compic?url=${encodeURIComponent(pageUrl)}`;
+  if (iframeMode) {
+    return (
+      <iframe
+        src={pageUrl}
+        title={title}
+        loading="lazy"
+        className="block w-[160px] h-[160px] max-w-full rounded-lg bg-gray-900"
+        style={{ border: 0 }}
+      />
+    );
+  }
+  return (
+    <button
+      type="button"
+      className="block"
+      onClick={() => onPreview(proxySrc)}
+      title={title}
+    >
+      <img
+        src={proxySrc}
+        alt={title}
+        loading="lazy"
+        className="max-w-[160px] max-h-[160px] object-contain"
+        onError={() => setIframeMode(true)}
+      />
+    </button>
+  );
+}
+
 interface ChatViewerProps {
   group: ChatGroupSummary;
   onBack: () => void;
@@ -443,26 +492,30 @@ const MessageContent: React.FC<{
           <MessageImage key={i} src={att.url} onPreview={onImagePreview} />
         ) : null;
       case "emoji": {
-        // media_type=9：真实 gif 在 sinaimg（防盗链），优先 img-proxy；失败再走 weibo-compic 解析 url_long
-        // media_type=15：sinaimg 直链，走代理
-        const isType9 = att.mediaType === 9;
-        const pageUrl =
-          isType9 && att.description?.includes("photo.weibo.com")
+        // media_type=9：真实 gif 在 sinaimg（防盗链），优先 img-proxy / weibo-compic；
+        // 服务端失败则降级 iframe 嵌入 weibo 原页面（见 Type9EmojiMedia）
+        if (att.mediaType === 9) {
+          const pageUrl = att.description?.includes("photo.weibo.com")
             ? att.description
-            : isType9 && att.url?.includes("photo.weibo.com")
+            : att.url?.includes("photo.weibo.com")
               ? att.url
               : null;
-        const gifUrl =
-          isType9 && att.url && /sinaimg\.cn/i.test(att.url) ? att.url : null;
-
-        let src: string | undefined;
-        if (isType9) {
-          if (gifUrl) src = toProxiedImageUrl(gifUrl) || gifUrl;
-          else if (pageUrl)
-            src = `/api/weibo-compic?url=${encodeURIComponent(pageUrl)}`;
-        } else {
-          src = toProxiedImageUrl(att.url) || att.url;
+          const gifUrl =
+            att.url && /sinaimg\.cn/i.test(att.url) ? att.url : null;
+          if (pageUrl) {
+            return (
+              <Type9EmojiMedia
+                key={i}
+                pageUrl={pageUrl}
+                gifUrl={gifUrl}
+                title={att.title || "表情"}
+                onPreview={onImagePreview}
+              />
+            );
+          }
+          // 无 compic 页面 URL（无法 iframe 兜底），走通用代理 + weserv 兜底
         }
+        const src = toProxiedImageUrl(att.url) || att.url;
         if (!src) return null;
 
         return (
@@ -479,12 +532,7 @@ const MessageContent: React.FC<{
               className="max-w-[160px] max-h-[160px] object-contain"
               onError={(e) => {
                 const el = e.currentTarget;
-                if (isType9 && pageUrl && !el.dataset.fallback) {
-                  el.dataset.fallback = "1";
-                  el.src = `/api/weibo-compic?url=${encodeURIComponent(pageUrl)}`;
-                  return;
-                }
-                if (!isType9 && !el.dataset.fallback && att.url) {
+                if (!el.dataset.fallback && att.url) {
                   el.dataset.fallback = "1";
                   el.src = `https://images.weserv.nl/?url=${encodeURIComponent(
                     att.url.replace(/^https?:\/\//, "")
