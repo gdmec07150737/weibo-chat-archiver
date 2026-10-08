@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "npx tsx server.ts",
+    "relay": "node scripts/win-image-relay.mjs",
     "lint": "tsc --noEmit",
     "build": "tsc && vite build",
     "preview": "vite preview"

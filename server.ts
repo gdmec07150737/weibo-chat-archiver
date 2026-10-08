@@ -18,11 +18,48 @@ import {
 import express from "express";
 import { createServer as createViteServer } from "vite";
 import https from "node:https";
+import dns from "node:dns";
 import crypto from "node:crypto";
 import fsSync from "node:fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import { isAllowedProxyTarget } from "./services/imageProxy";
+
+// WSL mirrored 网络下 IPv6 路由常不通（AAAA 优先解析会导致上游图片拉取超时），
+// 强制 IPv4 优先，sinaimg/photo.weibo.com 均有 A 记录，不受影响。
+dns.setDefaultResultOrder("ipv4first");
+
+// ---- Windows 侧图片中转（可选，自动探测）----
+// WSL 出站到新浪 CDN 不通时，在 Windows 终端运行 scripts/win-image-relay.mjs（127.0.0.1:18777），
+// mirroed 模式下 WSL 可直接访问宿主 localhost，服务端拉图自动改走中转；未运行则回落直连。
+const IMAGE_RELAY_BASE = process.env.WB_IMAGE_RELAY || "http://127.0.0.1:18777";
+let relayAlive: boolean | null = null;
+let relayCheckedAt = 0;
+const relayAvailable = async (): Promise<boolean> => {
+  const now = Date.now();
+  if (now - relayCheckedAt > 30000) {
+    relayCheckedAt = now;
+    relayAlive = null;
+    try {
+      const r = await fetch(`${IMAGE_RELAY_BASE}/health`, {
+        signal: AbortSignal.timeout(1500),
+      });
+      relayAlive = r.ok;
+    } catch {
+      relayAlive = false;
+    }
+    if (relayAlive) console.log("[relay] 已接入 Windows 图片中转", IMAGE_RELAY_BASE);
+  }
+  return relayAlive === true;
+};
+/** 上游抓取：relay 在线时经中转（由 Windows 侧带 Referer 代拉），否则直连 */
+const upstreamFetch = (url: string, init?: RequestInit): Promise<Response> => {
+  return relayAvailable().then((ok) =>
+    ok
+      ? fetch(`${IMAGE_RELAY_BASE}/fetch?url=${encodeURIComponent(url)}`, init)
+      : fetch(url, init)
+  );
+};
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -231,7 +268,7 @@ async function startServer() {
 
       let upstream: Response | null = null;
       for (const referer of referers) {
-        const resp = await fetch(target.toString(), {
+        const resp = await upstreamFetch(target.toString(), {
           headers: { ...commonHeaders, Referer: referer },
           redirect: "follow",
         });
@@ -268,9 +305,81 @@ async function startServer() {
   });
 
   /**
-   * media_type=9 表情：url_long 是 H5 页，解析其中 <img src="...sinaimg...gif"> 再带 Referer 拉取。
+   * media_type=9 短链 GIF 表情：url_long 是 photo.weibo.com 的 H5 页。
+   * 策略（抗 WSL 侧偶发网络超时）：
+   *   ① 磁盘缓存优先（成功一次永久本地化，重启/断网也能显示）；
+   *   ② 从 url 提取 pic_id 直拼 sinaimg 直链（wx1/wx2/wx4 候选），带 Referer: https://weibo.com；
+   *   ③ 兜底：拉取 H5 页解析 <img src="...sinaimg...gif"> 再拉取。
    * 用法：/api/weibo-compic?url=https://photo.weibo.com/h5/comment/compic_id/...
    */
+  const COMPIC_CACHE_DIR = path.join(process.cwd(), "gif-cache");
+  const COMPIC_ID_RE = /compic_id\/\d+:\d+([a-z][a-zA-Z0-9]+)/i;
+
+  const findCachedGif = (key: string): string | null => {
+    if (!fsSync.existsSync(COMPIC_CACHE_DIR)) return null;
+    for (const ext of [".gif", ".png", ".jpg", ".webp"]) {
+      const file = path.join(COMPIC_CACHE_DIR, key + ext);
+      if (fsSync.existsSync(file)) return file;
+    }
+    return null;
+  };
+
+  const fetchImageWithReferer = async (
+    url: string,
+    errs: string[]
+  ): Promise<Buffer | null> => {
+    const host = new URL(url).hostname;
+    try {
+      const resp = await upstreamFetch(url, {
+        headers: {
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+          Accept: "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+          Referer: "https://weibo.com/",
+        },
+        redirect: "follow",
+        signal: AbortSignal.timeout(10000),
+      });
+      if (!resp.ok) {
+        let detail = "";
+        try {
+          detail = (await resp.text()).slice(0, 80);
+        } catch {}
+        errs.push(`${host}:HTTP${resp.status}${detail ? "(" + detail + ")" : ""}`);
+        return null;
+      }
+      const buf = Buffer.from(await resp.arrayBuffer());
+      if (buf.length < 100) {
+        errs.push(`${host}:too-small`);
+        return null;
+      }
+      // 魔数校验：必须是已知图片格式（防止把 HTML 错误页当图片落盘）
+      const isKnownImage =
+        buf.toString("ascii", 0, 3) === "GIF" ||
+        (buf[0] === 0xff && buf[1] === 0xd8) ||
+        (buf[0] === 0x89 && buf[1] === 0x50) ||
+        (buf.length > 12 && buf.toString("ascii", 0, 4) === "RIFF");
+      if (!isKnownImage) {
+        errs.push(`${host}:bad-magic`);
+        return null;
+      }
+      return buf;
+    } catch (e: any) {
+      const code = e?.cause?.code || e?.code || e?.name || "err";
+      errs.push(`${host}:${code}`);
+      return null;
+    }
+  };
+
+  const saveGifCache = (key: string, buf: Buffer): string => {
+    fsSync.mkdirSync(COMPIC_CACHE_DIR, { recursive: true });
+    const file = path.join(COMPIC_CACHE_DIR, key + (IMG_MIME_EXT[detectImgMime(buf)] || ".gif"));
+    const tmp = file + ".tmp";
+    fsSync.writeFileSync(tmp, buf);
+    fsSync.renameSync(tmp, file);
+    return file;
+  };
+
   app.get("/api/weibo-compic", async (req, res) => {
     try {
       const raw = typeof req.query.url === "string" ? req.query.url : "";
@@ -286,48 +395,71 @@ async function startServer() {
         return res.status(403).send("Host not allowed");
       }
 
-      const pageResp = await fetch(page.toString(), {
-        headers: {
-          "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-          Accept: "text/html,application/xhtml+xml",
-          Referer: "https://weibo.com/",
-        },
-        redirect: "follow",
-      });
-      if (!pageResp.ok) {
-        return res.status(pageResp.status).send(`Page ${pageResp.status}`);
-      }
-      const html = await pageResp.text();
-      const imgMatch = html.match(
-        /src=["'](https?:\/\/[^"']*sinaimg\.cn[^"']+\.gif)["']/i
-      );
-      if (!imgMatch?.[1]) {
-        return res.status(404).send("Gif not found in page");
+      const m = raw.match(COMPIC_ID_RE);
+      const cacheKey = m ? m[1] : avatarUrlHash(raw);
+      const cachedFile = findCachedGif(cacheKey);
+      if (cachedFile) {
+        sendAvatarFile(res, cachedFile);
+        return;
       }
 
-      const gifUrl = imgMatch[1].replace(/^http:/, "https:");
-      if (!isAllowedProxyTarget(gifUrl)) {
-        return res.status(403).send("Gif host not allowed");
+      // 优先：pic_id 直拼 sinaimg 直链（跳过 photo.weibo.com H5 页这一跳）
+      const errs: string[] = [];
+      const candidates: string[] = [];
+      if (m) {
+        for (const sub of ["wx1", "wx2", "wx4"]) {
+          candidates.push(`https://${sub}.sinaimg.cn/bmiddle/${m[1]}.gif`);
+        }
+      }
+      let buf: Buffer | null = null;
+      for (const url of candidates) {
+        buf = await fetchImageWithReferer(url, errs);
+        if (buf) break;
       }
 
-      const gifResp = await fetch(gifUrl, {
-        headers: {
-          Referer: "https://photo.weibo.com/",
-          "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-          Accept: "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-        },
-        redirect: "follow",
-      });
-      if (!gifResp.ok) {
-        return res.status(gifResp.status).send(`Gif ${gifResp.status}`);
+      // 兜底：解析 H5 页拿真实 gif 地址
+      if (!buf) {
+        try {
+          const pageResp = await upstreamFetch(page.toString(), {
+            headers: {
+              "User-Agent":
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+              Accept: "text/html,application/xhtml+xml",
+              Referer: "https://weibo.com/",
+            },
+            redirect: "follow",
+            signal: AbortSignal.timeout(10000),
+          });
+          if (pageResp.ok) {
+            const html = await pageResp.text();
+            const imgMatch = html.match(
+              /src=["'](https?:\/\/[^"']*sinaimg\.cn[^"']+\.gif)["']/i
+            );
+            if (imgMatch?.[1] && isAllowedProxyTarget(imgMatch[1])) {
+              buf = await fetchImageWithReferer(
+                imgMatch[1].replace(/^http:/, "https:"),
+                errs
+              );
+            } else {
+              errs.push("page:no-gif-or-denied");
+            }
+          } else {
+            errs.push(`page:HTTP${pageResp.status}`);
+          }
+        } catch (e: any) {
+          errs.push(`page:${e?.cause?.code || e?.code || e?.name || "err"}`);
+        }
       }
 
-      const contentType = gifResp.headers.get("content-type") || "image/gif";
-      const buf = Buffer.from(await gifResp.arrayBuffer());
-      res.setHeader("Content-Type", contentType);
-      res.setHeader("Cache-Control", "public, max-age=86400");
+      if (!buf) {
+        return res
+          .status(502)
+          .send(`Compic unavailable (${errs.join(", ") || "no candidates"})`);
+      }
+
+      saveGifCache(cacheKey, buf);
+      res.setHeader("Content-Type", detectImgMime(buf));
+      res.setHeader("Cache-Control", "public, max-age=604800");
       res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
       return res.send(buf);
     } catch (error) {
