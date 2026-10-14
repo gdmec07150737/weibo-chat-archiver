@@ -132,3 +132,4 @@ Node.js 版本：v22.17.1
 - `/api/groups`、`/api/stats`、`/api/groups/:id/stats` 有 60 秒服务端内存缓存，「历史备份」页的**刷新元数据**按钮会带 `refresh=1` 强制重查
 - MySQL 建议 `innodb_buffer_pool_size` ≥ 512M（数据约 1.3GB，默认 128M 会明显拖慢全表聚合）；如在线调过（`SET GLOBAL innodb_buffer_pool_size=536870912`），重启后需写入 `my.cnf` 持久化
 - `avatar-cache/`、`gif-cache/`、`emoji-assets/`、`backups/` 均为可再生成的派生数据，已在 `.gitignore` 中忽略；删除后可按上文方法重建（缓存目录无需重建，会按需自动填充）
+
