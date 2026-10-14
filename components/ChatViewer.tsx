@@ -258,61 +258,228 @@ const ResizableFloatingPanel: React.FC<{
   );
 };
 
+/**
+ * 微博查看器风格的图片灯箱：
+ * - 底部工具栏：缩小 / 百分比 / 放大 / 下载 / 关闭
+ * - 鼠标左键按住拖动平移，滚轮缩放（以光标为中心），双击在适合大小与放大间切换
+ * - Esc 关闭；保留 直链→本地代理→weserv 三级降级
+ */
 const ImageLightbox: React.FC<{ src: string; onClose: () => void }> = ({ src, onClose }) => {
   // 弹窗优先直链；仅 sinaimg 才走本地代理
   const [displaySrc, setDisplaySrc] = useState(src);
   const [stage, setStage] = useState(0);
+  const [scale, setScale] = useState(1);
+  const [offset, setOffset] = useState({ x: 0, y: 0 });
+  const [dragging, setDragging] = useState(false);
+  const dragRef = useRef<{ startX: number; startY: number; baseX: number; baseY: number } | null>(null);
+  const stageRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     setDisplaySrc(src);
     setStage(0);
+    setScale(1);
+    setOffset({ x: 0, y: 0 });
   }, [src]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") onClose();
+      if (e.key === "+" || e.key === "=") setScale((s) => Math.min(8, s * 1.25));
+      if (e.key === "-") setScale((s) => Math.max(0.2, s / 1.25));
+      if (e.key === "0") {
+        setScale(1);
+        setOffset({ x: 0, y: 0 });
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
 
+  // 滚轮缩放（非 passive，才能 preventDefault 阻止页面滚动）
+  useEffect(() => {
+    const el = stageRef.current;
+    if (!el) return;
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+      setScale((prev) => {
+        const next = Math.min(8, Math.max(0.2, prev * factor));
+        // 以光标为缩放中心：调整平移量使光标下的内容保持不动
+        const rect = el.getBoundingClientRect();
+        const cx = e.clientX - (rect.left + rect.width / 2);
+        const cy = e.clientY - (rect.top + rect.height / 2);
+        setOffset((o) => ({
+          x: cx - ((cx - o.x) * next) / prev,
+          y: cy - ((cy - o.y) * next) / prev,
+        }));
+        return next;
+      });
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  }, [displaySrc]);
+
+  const startDrag = (e: React.MouseEvent) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    setDragging(true);
+    dragRef.current = { startX: e.clientX, startY: e.clientY, baseX: offset.x, baseY: offset.y };
+  };
+  const onDrag = (e: React.MouseEvent) => {
+    if (!dragging || !dragRef.current) return;
+    setOffset({
+      x: dragRef.current.baseX + (e.clientX - dragRef.current.startX),
+      y: dragRef.current.baseY + (e.clientY - dragRef.current.startY),
+    });
+  };
+  const endDrag = () => {
+    setDragging(false);
+    dragRef.current = null;
+  };
+
+  const zoomBy = (factor: number) => {
+    setScale((s) => Math.min(8, Math.max(0.2, s * factor)));
+  };
+
+  const handleDownload = async () => {
+    try {
+      const resp = await fetch(displaySrc, { referrerPolicy: "no-referrer" });
+      if (!resp.ok) throw new Error(String(resp.status));
+      const blob = await resp.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      const ext = blob.type.includes("png") ? "png" : blob.type.includes("webp") ? "webp" : blob.type.includes("jpeg") ? "jpg" : "gif";
+      a.href = url;
+      a.download = `weibo-image-${Date.now()}.${ext}`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch {
+      window.open(displaySrc, "_blank");
+    }
+  };
+
   return (
     <div
-      className="fixed inset-0 z-[100000] bg-black/80 flex items-center justify-center p-4"
+      className="fixed inset-0 z-[100000] bg-black/90 flex flex-col"
       onClick={onClose}
     >
-      <button
-        className="absolute top-4 right-4 text-white/80 hover:text-white text-sm px-3 py-1.5 bg-white/10 rounded-lg"
-        onClick={onClose}
-      >
-        关闭 Esc
-      </button>
-      <img
-        src={displaySrc}
-        alt="预览"
-        className="max-w-[95vw] max-h-[90vh] object-contain rounded-lg shadow-2xl"
-        referrerPolicy="no-referrer"
+      {/* 顶栏 */}
+      <div className="absolute top-3 right-4 z-10 flex items-center gap-2" onClick={(e) => e.stopPropagation()}>
+        <button
+          className="text-white/80 hover:text-white text-sm px-3 py-1.5 bg-white/10 hover:bg-white/20 rounded-lg"
+          onClick={onClose}
+        >
+          关闭 Esc
+        </button>
+      </div>
+
+      {/* 图片舞台：拖动 / 滚轮缩放 / 双击复位 */}
+      <div
+        ref={stageRef}
+        className="flex-1 flex items-center justify-center overflow-hidden p-4 min-h-0"
         onClick={(e) => e.stopPropagation()}
-        onError={() => {
-          if (stage === 0) {
-            const proxied = toProxiedImageUrl(src);
-            if (proxied && proxied !== src) {
-              setStage(1);
-              setDisplaySrc(proxied);
-            } else {
+        onDoubleClick={() => {
+          if (scale !== 1) {
+            setScale(1);
+            setOffset({ x: 0, y: 0 });
+          } else {
+            setScale(2.5);
+          }
+        }}
+      >
+        <img
+          src={displaySrc}
+          alt="预览"
+          draggable={false}
+          referrerPolicy="no-referrer"
+          className="max-w-[95vw] max-h-[85vh] object-contain rounded-lg shadow-2xl select-none"
+          style={{
+            transform: `translate(${offset.x}px, ${offset.y}px) scale(${scale})`,
+            transformOrigin: "center center",
+            cursor: dragging ? "grabbing" : scale > 1 ? "grab" : "zoom-in",
+            transition: dragging ? "none" : "transform 0.15s ease-out",
+            userSelect: "none",
+          } as React.CSSProperties}
+          onMouseDown={startDrag}
+          onMouseMove={onDrag}
+          onMouseUp={endDrag}
+          onMouseLeave={endDrag}
+          onError={() => {
+            if (stage === 0) {
+              const proxied = toProxiedImageUrl(src);
+              if (proxied && proxied !== src) {
+                setStage(1);
+                setDisplaySrc(proxied);
+              } else {
+                setStage(2);
+                setDisplaySrc(
+                  `https://images.weserv.nl/?url=${encodeURIComponent(src.replace(/^https?:\/\//, ""))}`
+                );
+              }
+            } else if (stage === 1) {
               setStage(2);
               setDisplaySrc(
                 `https://images.weserv.nl/?url=${encodeURIComponent(src.replace(/^https?:\/\//, ""))}`
               );
             }
-          } else if (stage === 1) {
-            setStage(2);
-            setDisplaySrc(
-              `https://images.weserv.nl/?url=${encodeURIComponent(src.replace(/^https?:\/\//, ""))}`
-            );
-          }
-        }}
-      />
+          }}
+        />
+      </div>
+
+      {/* 底部工具栏（微博查看器样式） */}
+      <div
+        className="pb-5 pt-2 flex justify-center"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center gap-1 bg-black/60 border border-white/10 rounded-full px-3 py-2 shadow-xl backdrop-blur">
+          <button
+            title="缩小（滚轮向下 / -）"
+            className="w-9 h-9 flex items-center justify-center text-white/85 hover:text-white hover:bg-white/10 rounded-full text-lg"
+            onClick={() => zoomBy(1 / 1.25)}
+          >
+            −
+          </button>
+          <button
+            title="点击恢复 100%"
+            className="min-w-[3.4rem] h-9 text-white/85 hover:text-white hover:bg-white/10 rounded-full text-xs tabular-nums"
+            onClick={() => {
+              setScale(1);
+              setOffset({ x: 0, y: 0 });
+            }}
+          >
+            {Math.round(scale * 100)}%
+          </button>
+          <button
+            title="放大（滚轮向上 / +）"
+            className="w-9 h-9 flex items-center justify-center text-white/85 hover:text-white hover:bg-white/10 rounded-full text-lg"
+            onClick={() => zoomBy(1.25)}
+          >
+            +
+          </button>
+          <div className="w-px h-5 bg-white/15 mx-1" />
+          <button
+            title="下载图片"
+            className="w-9 h-9 flex items-center justify-center text-white/85 hover:text-white hover:bg-white/10 rounded-full"
+            onClick={handleDownload}
+          >
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+              <polyline points="7 10 12 15 17 10" />
+              <line x1="12" y1="15" x2="12" y2="3" />
+            </svg>
+          </button>
+          <button
+            title="关闭 (Esc)"
+            className="w-9 h-9 flex items-center justify-center text-white/85 hover:text-white hover:bg-white/10 rounded-full"
+            onClick={onClose}
+          >
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+              <line x1="18" y1="6" x2="6" y2="18" />
+              <line x1="6" y1="6" x2="18" y2="18" />
+            </svg>
+          </button>
+        </div>
+      </div>
     </div>
   );
 };
