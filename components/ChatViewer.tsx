@@ -272,6 +272,7 @@ const ImageLightbox: React.FC<{ src: string; onClose: () => void }> = ({ src, on
   const [offset, setOffset] = useState({ x: 0, y: 0 });
   const [dragging, setDragging] = useState(false);
   const dragRef = useRef<{ startX: number; startY: number; baseX: number; baseY: number } | null>(null);
+  const dragMovedRef = useRef(false);
   const stageRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
@@ -323,13 +324,17 @@ const ImageLightbox: React.FC<{ src: string; onClose: () => void }> = ({ src, on
     if (e.button !== 0) return;
     e.preventDefault();
     setDragging(true);
+    dragMovedRef.current = false;
     dragRef.current = { startX: e.clientX, startY: e.clientY, baseX: offset.x, baseY: offset.y };
   };
   const onDrag = (e: React.MouseEvent) => {
     if (!dragging || !dragRef.current) return;
+    const dx = e.clientX - dragRef.current.startX;
+    const dy = e.clientY - dragRef.current.startY;
+    if (Math.abs(dx) > 3 || Math.abs(dy) > 3) dragMovedRef.current = true;
     setOffset({
-      x: dragRef.current.baseX + (e.clientX - dragRef.current.startX),
-      y: dragRef.current.baseY + (e.clientY - dragRef.current.startY),
+      x: dragRef.current.baseX + dx,
+      y: dragRef.current.baseY + dy,
     });
   };
   const endDrag = () => {
@@ -361,7 +366,14 @@ const ImageLightbox: React.FC<{ src: string; onClose: () => void }> = ({ src, on
   return (
     <div
       className="fixed inset-0 z-[100000] bg-black/90 flex flex-col"
-      onClick={onClose}
+      onClick={() => {
+        // 刚拖动过图片时松手产生的 click 不视为「点击背景关闭」
+        if (dragMovedRef.current) {
+          dragMovedRef.current = false;
+          return;
+        }
+        onClose();
+      }}
     >
       {/* 顶栏 */}
       <div className="absolute top-3 right-4 z-10 flex items-center gap-2" onClick={(e) => e.stopPropagation()}>
@@ -377,7 +389,6 @@ const ImageLightbox: React.FC<{ src: string; onClose: () => void }> = ({ src, on
       <div
         ref={stageRef}
         className="flex-1 flex items-center justify-center overflow-hidden p-4 min-h-0"
-        onClick={(e) => e.stopPropagation()}
         onDoubleClick={() => {
           if (scale !== 1) {
             setScale(1);
@@ -404,6 +415,7 @@ const ImageLightbox: React.FC<{ src: string; onClose: () => void }> = ({ src, on
           onMouseMove={onDrag}
           onMouseUp={endDrag}
           onMouseLeave={endDrag}
+          onClick={(e) => e.stopPropagation()}
           onError={() => {
             if (stage === 0) {
               const proxied = toProxiedImageUrl(src);
