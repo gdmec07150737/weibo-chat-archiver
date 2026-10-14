@@ -60,7 +60,7 @@ Node.js 版本：v22.17.1
    "%USERPROFILE%\.workbuddy\bin\mkcert.exe" localhost 127.0.0.1 ::1
    ```
 
-4. 重启服务（WSL 里 `Ctrl+C` 后重新 `npm run dev`），浏览器访问 `https://localhost:5173/`，地址栏出现**锁图标、无警告**即成功。
+4. 重启服务（WSL 里 `Ctrl+C` 后重新 `npm run dev` 或者 CMD (或者 Windows PowerShell，因为已经改成兼容Windows本地启动) 里 `Ctrl+C` 后重新 `npm run dev`），浏览器访问 `https://localhost:5173/`，地址栏出现**锁图标、无警告**即成功。
 
 > 注意：证书过期时浏览器上一次点过「继续前往」，可能一直没发现，排查时先看地址栏有没有锁图标。
 
