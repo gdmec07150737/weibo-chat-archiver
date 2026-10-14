@@ -2,6 +2,8 @@ import type {
   ChatDayStat,
   ChatGroupSummary,
   ChatUserSummary,
+  GroupInfoSummary,
+  GroupMember,
   GroupStats,
   GroupUsersPage,
   MessagePage,
@@ -18,9 +20,40 @@ async function getJson<T>(url: string): Promise<T> {
   return res.json() as Promise<T>;
 }
 
-export async function fetchGroups(): Promise<ChatGroupSummary[]> {
-  const data = await getJson<{ groups: ChatGroupSummary[] }>("/api/groups");
+export async function fetchGroups(refresh = false): Promise<ChatGroupSummary[]> {
+  const data = await getJson<{ groups: ChatGroupSummary[] }>(
+    refresh ? "/api/groups?refresh=1" : "/api/groups"
+  );
   return data.groups || [];
+}
+
+/** 粘贴 query_group.json 的响应 JSON 导入群信息表 */
+export async function importGroupInfo(
+  payload: unknown
+): Promise<{ success: boolean; groups: number; members: number; gids: string[] }> {
+  const res = await fetch("/api/group-info/import", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const data = await res.json().catch(() => null);
+  if (!res.ok) {
+    throw new Error(data?.error || `导入失败: ${res.status}`);
+  }
+  return data;
+}
+
+export async function fetchGroupInfoList(): Promise<GroupInfoSummary[]> {
+  const data = await getJson<{ groups: GroupInfoSummary[] }>("/api/group-info");
+  return data.groups || [];
+}
+
+export async function fetchGroupInfoDetail(
+  gid: string
+): Promise<{ info: GroupInfoSummary; members: GroupMember[] }> {
+  return getJson<{ info: GroupInfoSummary; members: GroupMember[] }>(
+    `/api/group-info/${encodeURIComponent(gid)}`
+  );
 }
 
 export async function fetchGroupDays(groupId: string): Promise<ChatDayStat[]> {
@@ -105,8 +138,8 @@ export async function fetchGroupStats(groupId: string): Promise<GroupStats> {
   return getJson<GroupStats>(`/api/groups/${encodeURIComponent(groupId)}/stats`);
 }
 
-export async function fetchOverallStats(): Promise<OverallStats> {
-  return getJson<OverallStats>("/api/stats");
+export async function fetchOverallStats(refresh = false): Promise<OverallStats> {
+  return getJson<OverallStats>(refresh ? "/api/stats?refresh=1" : "/api/stats");
 }
 
 export async function uploadBackup(payload: {

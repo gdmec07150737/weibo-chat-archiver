@@ -216,6 +216,7 @@ export async function ensureSchema(): Promise<void> {
 
   await migrateFromLegacyArchives(db);
   await ensureUsersSchema(db);
+  await ensureGroupInfoSchema(db);
   try {
     await db.query(
       `ALTER TABLE chat_messages ADD KEY idx_group_sender (group_id, sender_id)`
@@ -888,8 +889,444 @@ export async function fillUserAvatarFromMessages(
   };
 }
 
-export async function listGroups(): Promise<ChatGroupSummary[]> {
+/* ------------------------------------------------------------------ */
+/* 微博群信息（query_group.json 导入）                                   */
+/* ------------------------------------------------------------------ */
+
+async function ensureGroupInfoSchema(db: mysql.Pool): Promise<void> {
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS group_info (
+      gid             VARCHAR(64)     NOT NULL,
+      name            VARCHAR(255)    NULL,
+      description     TEXT            NULL,
+      announcement    TEXT            NULL,
+      owner_uid       VARCHAR(64)     NULL,
+      user_count      INT UNSIGNED    NULL,
+      max_member      INT UNSIGNED    NULL,
+      avatar_url      VARCHAR(512)    NULL,
+      group_url       VARCHAR(512)    NULL,
+      group_no        VARCHAR(32)     NULL,
+      nick            VARCHAR(255)    NULL,
+      create_time_unix INT UNSIGNED   NULL,
+      raw_json        JSON            NOT NULL,
+      imported_at     DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at      DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (gid)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+  // 兼容已建过的旧表：补齐后加的列（best-effort）
+  for (const sql of [
+    `ALTER TABLE group_info ADD COLUMN announcement TEXT NULL`,
+    `ALTER TABLE group_info ADD COLUMN max_member INT UNSIGNED NULL`,
+    `ALTER TABLE group_info ADD COLUMN group_url VARCHAR(512) NULL`,
+    `ALTER TABLE group_info ADD COLUMN group_no VARCHAR(32) NULL`,
+    `ALTER TABLE group_info ADD COLUMN nick VARCHAR(255) NULL`,
+    `ALTER TABLE group_info ADD COLUMN create_time_unix INT UNSIGNED NULL`,
+  ]) {
+    try {
+      await db.query(sql);
+    } catch {
+      // duplicate column → 已存在
+    }
+  }
+  // 用户方案：成员并入 users 表（gids 字段记录所属群，多群逗号分隔），
+  // 不再单独建 group_members 表；已建过的直接删掉。
+  try {
+    await db.query(`DROP TABLE IF EXISTS group_members`);
+  } catch {
+    // ignore
+  }
+  try {
+    await db.query(
+      `ALTER TABLE users ADD COLUMN gids VARCHAR(255) NULL, ADD KEY idx_users_gids (gids(64))`
+    );
+  } catch {
+    // duplicate column → 已存在
+  }
+}
+
+/** 从对象里按候选键顺序取第一个非空值 */
+function pickField(obj: any, keys: string[]): any {
+  if (!obj || typeof obj !== "object") return undefined;
+  for (const k of keys) {
+    const v = obj[k];
+    if (v !== undefined && v !== null && v !== "") return v;
+  }
+  return undefined;
+}
+
+/**
+ * 在任意嵌套结构里找到「群数组」。
+ * 实测 query_group.json 的响应就是**顶层单个群对象**（id/name/members 直接在根上），
+ * 也兼容 groups/list/data.list 等包裹形状。
+ */
+function findGroupsArray(json: any): any[] {
+  const looksLikeGroup = (it: any) =>
+    !!it &&
+    typeof it === "object" &&
+    !Array.isArray(it) &&
+    (it.gid != null ||
+      (it.id != null &&
+        (it.name != null ||
+          it.group_name != null ||
+          it.user_count != null ||
+          it.member_count != null ||
+          it.members != null ||
+          it.member_infos != null ||
+          it.member_list != null ||
+          it.user_list != null)));
+
+  if (Array.isArray(json)) {
+    return json.some(looksLikeGroup) ? json : [];
+  }
+  if (!json || typeof json !== "object") return [];
+  // 单个群对象直接当群列表返回（query_group.json 的真实形状）
+  if (looksLikeGroup(json)) return [json];
+
+  for (const key of ["groups", "list", "group_list", "data", "result", "cards", "group"]) {
+    const next = json[key];
+    if (Array.isArray(next)) {
+      const found = findGroupsArray(next);
+      if (found.length > 0) return found;
+    } else if (next && typeof next === "object") {
+      const found = findGroupsArray(next);
+      if (found.length > 0) return found;
+    }
+  }
+  return [];
+}
+
+function findMembersArray(group: any): any[] {
+  // 实测：详细信息在 member_infos；members 只是纯 uid 数组
+  for (const key of ["member_infos", "members", "member_list", "user_list", "users", "members_list"]) {
+    const arr = group?.[key];
+    if (Array.isArray(arr)) return arr;
+  }
+  return [];
+}
+
+/** 纯数字 uid 数组 → 成员对象数组 */
+function normalizeMemberEntry(m: any): { uid: string; obj: any } | null {
+  if (m == null) return null;
+  if (typeof m === "number" || typeof m === "string") {
+    const s = String(m).trim();
+    return s ? { uid: s, obj: null } : null;
+  }
+  if (typeof m === "object") {
+    const raw = pickField(m, ["uid", "id", "idstr", "user_id"]);
+    if (raw == null) return null;
+    return { uid: String(raw), obj: m };
+  }
+  return null;
+}
+
+export type GroupInfoImportResult = {
+  groups: number;
+  members: number;
+  gids: string[];
+};
+
+/**
+ * 导入 query_group.json 的响应 JSON（宽容解析：群字段名、包裹层级都不确定，
+ * 解析不到的放进 raw_json 原文，永不丢数据）。
+ */
+export async function upsertGroupInfoImport(payload: unknown): Promise<GroupInfoImportResult> {
+  let json: any = payload;
+  if (typeof payload === "string") {
+    try {
+      json = JSON.parse(payload);
+    } catch {
+      throw new Error("粘贴的内容不是合法 JSON");
+    }
+  }
+  if (Array.isArray(json) && json.length === 1) json = json[0];
+  // 兼容 {json: "..."} 或 {data: "..."} 里塞了字符串的情况
+  if (json && typeof json.json === "string") {
+    try { json = JSON.parse(json.json); } catch { /* keep */ }
+  }
+
+  const groups = findGroupsArray(json);
+  if (groups.length === 0) {
+    throw new Error("没能在 JSON 中找到群列表（期望包含 gid/name/members 的数组）");
+  }
+
   const db = getPool();
+  let memberTotal = 0;
+  const gids: string[] = [];
+
+  for (const g of groups) {
+    const gidRaw = pickField(g, ["gid", "id", "group_id", "groupid"]);
+    if (gidRaw == null) continue;
+    const gid = String(gidRaw);
+    gids.push(gid);
+
+    const ownerRaw = pickField(g, ["owner", "owner_uid", "owner_id", "admin_uid"]);
+    const ownerUid =
+      ownerRaw != null
+        ? String(ownerRaw)
+        : g?.owner && typeof g.owner === "object"
+          ? String(pickField(g.owner, ["id", "idstr", "uid"]) ?? "")
+          : null;
+
+    const avatarRaw = pickField(g, [
+      "avatar_large",
+      "avatar_hd",
+      "avatar",
+      "round_avatar",
+      "avatar_s",
+      "cover",
+      "pic",
+      "group_avatar",
+    ]);
+    const avatarUrl = avatarRaw
+      ? String(avatarRaw).split("?")[0].replace(/^http:/, "https:")
+      : null;
+
+    const countRaw = pickField(g, ["member_count", "user_count", "member_num", "users_count", "total"]);
+
+    // 群公告：实测在 bulletin.content 里
+    const bulletin = g?.bulletin;
+    const announcement =
+      pickField(g, ["announcement", "notice", "bulletin_text"])?.toString() ??
+      (bulletin && typeof bulletin === "object"
+        ? (pickField(bulletin, ["content", "text"])?.toString() ?? null)
+        : typeof bulletin === "string"
+          ? bulletin
+          : null);
+
+    const groupUrlRaw = pickField(g, ["group_url", "url", "scheme"]);
+    const groupNoRaw = pickField(g, ["no", "group_no", "groupno"]);
+    const nickRaw = pickField(g, ["nick", "my_nick", "user_nick"]);
+    const maxMemberRaw = pickField(g, ["max_member", "maxmember"]);
+    const createTimeRaw = pickField(g, ["create_time", "createTime"]);
+
+    await db.query(
+      `INSERT INTO group_info
+         (gid, name, description, announcement, owner_uid, user_count, max_member,
+          avatar_url, group_url, group_no, nick, create_time_unix, raw_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CAST(? AS JSON))
+       ON DUPLICATE KEY UPDATE
+         name = VALUES(name),
+         description = VALUES(description),
+         announcement = VALUES(announcement),
+         owner_uid = VALUES(owner_uid),
+         user_count = VALUES(user_count),
+         max_member = VALUES(max_member),
+         avatar_url = VALUES(avatar_url),
+         group_url = VALUES(group_url),
+         group_no = VALUES(group_no),
+         nick = VALUES(nick),
+         create_time_unix = VALUES(create_time_unix),
+         raw_json = VALUES(raw_json)`,
+      [
+        gid,
+        pickField(g, ["name", "group_name", "system_name", "title"])?.toString() ?? null,
+        // 实测群简介字段是 summary
+        pickField(g, ["summary", "desc", "description", "introduction"])?.toString() ?? null,
+        announcement,
+        ownerUid || null,
+        countRaw != null && Number.isFinite(Number(countRaw)) ? Number(countRaw) : null,
+        maxMemberRaw != null && Number.isFinite(Number(maxMemberRaw)) ? Number(maxMemberRaw) : null,
+        avatarUrl || null,
+        groupUrlRaw ? String(groupUrlRaw).slice(0, 512) : null,
+        groupNoRaw != null ? String(groupNoRaw).slice(0, 32) : null,
+        nickRaw != null ? String(nickRaw).slice(0, 255) : null,
+        createTimeRaw != null && Number.isFinite(Number(createTimeRaw)) ? Number(createTimeRaw) : null,
+        JSON.stringify(g),
+      ]
+    );
+
+    // 群主/管理员角色不单独存表：详情查询时从 group_info.raw_json 的 owner/admins 动态解析
+
+    // 成员列表（member_infos 带昵称/头像；members 只有纯 uid）→ 并入 users 表（gids 记录归属）
+    const members = findMembersArray(g);
+    const seen = new Set<string>();
+    for (const m of members) {
+      const parsed = normalizeMemberEntry(m);
+      if (!parsed || seen.has(parsed.uid)) continue;
+      seen.add(parsed.uid);
+      const { uid, obj } = parsed;
+      const mAvatar = obj
+        ? pickField(obj, ["avatar_hd", "avatar_large", "profile_image_url", "avatar", "avatar_url"])
+        : undefined;
+      const uidNum = Number(uid);
+      if (!Number.isFinite(uidNum) || uidNum <= 0) continue;
+      await db.query(
+        `INSERT INTO users (sender_id, screen_name, avatar_url, gids)
+         VALUES (?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE
+           screen_name = COALESCE(VALUES(screen_name), users.screen_name),
+           avatar_url  = COALESCE(VALUES(avatar_url), users.avatar_url),
+           gids = CASE WHEN FIND_IN_SET(VALUES(gids), users.gids) THEN users.gids
+                       ELSE TRIM(BOTH ',' FROM CONCAT_WS(',', users.gids, VALUES(gids))) END`,
+        [
+          uidNum,
+          obj ? pickField(obj, ["screen_name", "nickname", "name"])?.toString() ?? null : null,
+          mAvatar ? String(mAvatar).split("?")[0].replace(/^http:/, "https:") : null,
+          gid,
+        ]
+      );
+      memberTotal++;
+    }
+  }
+
+  if (gids.length === 0) {
+    throw new Error("群数组里的条目都没有 gid/id 字段");
+  }
+  return { groups: gids.length, members: memberTotal, gids };
+}
+
+export async function listGroupInfos(): Promise<
+  Array<GroupInfoSummaryLike>
+> {
+  const db = getPool();
+  const [rows] = await db.query<mysql.RowDataPacket[]>(
+    `SELECT gi.gid, gi.name, gi.description, gi.announcement, gi.owner_uid, gi.user_count,
+            gi.max_member, gi.avatar_url, gi.group_url, gi.group_no, gi.nick,
+            gi.create_time_unix, gi.imported_at,
+            (SELECT COUNT(*) FROM users u
+              WHERE FIND_IN_SET(gi.gid, u.gids) > 0) AS member_rows
+     FROM group_info gi
+     ORDER BY gi.imported_at DESC`
+  );
+  return rows.map((r) => ({
+    gid: String(r.gid),
+    name: r.name ? String(r.name) : null,
+    description: r.description ? String(r.description) : null,
+    announcement: r.announcement ? String(r.announcement) : null,
+    ownerUid: r.owner_uid ? String(r.owner_uid) : null,
+    userCount: r.user_count != null ? Number(r.user_count) : null,
+    maxMember: r.max_member != null ? Number(r.max_member) : null,
+    avatarUrl: r.avatar_url ? String(r.avatar_url) : null,
+    groupUrl: r.group_url ? String(r.group_url) : null,
+    groupNo: r.group_no ? String(r.group_no) : null,
+    nick: r.nick ? String(r.nick) : null,
+    createTimeUnix:
+      r.create_time_unix != null ? Number(r.create_time_unix) : null,
+    memberRows: Number(r.member_rows || 0),
+    importedAt: toIsoFromMysql(r.imported_at),
+  }));
+}
+export type GroupInfoSummaryLike = {
+  gid: string;
+  name: string | null;
+  description: string | null;
+  announcement: string | null;
+  ownerUid: string | null;
+  userCount: number | null;
+  maxMember: number | null;
+  avatarUrl: string | null;
+  groupUrl: string | null;
+  groupNo: string | null;
+  nick: string | null;
+  createTimeUnix: number | null;
+  memberRows: number;
+  importedAt: string | null;
+};
+
+function toIsoFromMysql(value: unknown): string | null {
+  if (value == null) return null;
+  return new Date(String(value).replace(" ", "T") + "+08:00").toISOString();
+}
+
+export async function getGroupInfoDetail(gid: string): Promise<{
+  info: GroupInfoSummaryLike;
+  members: Array<{
+    uid: string;
+    screenName: string | null;
+    avatarUrl: string | null;
+    role: number | null;
+    messageCount: number | null;
+    lastSeenAt: string | null;
+  }>;
+} | null> {
+  const db = getPool();
+  const [infoRows] = await db.query<mysql.RowDataPacket[]>(
+    `SELECT gid, name, description, announcement, owner_uid, user_count, max_member,
+            avatar_url, group_url, group_no, nick, create_time_unix, imported_at, raw_json,
+            (SELECT COUNT(*) FROM users u
+              WHERE FIND_IN_SET(group_info.gid, u.gids) > 0) AS member_rows
+     FROM group_info WHERE gid = ? LIMIT 1`,
+    [gid]
+  );
+  if (infoRows.length === 0) return null;
+  const r = infoRows[0];
+
+  // 角色：2=群主，1=管理员，NULL=普通成员（从导入时的 raw_json 动态解析）
+  let ownerUid: string | null = r.owner_uid ? String(r.owner_uid) : null;
+  const adminSet = new Set<string>();
+  try {
+    const raw = typeof r.raw_json === "string" ? JSON.parse(r.raw_json) : r.raw_json;
+    if (raw) {
+      if (raw.owner != null) ownerUid = String(raw.owner);
+      if (Array.isArray(raw.admins)) {
+        for (const a of raw.admins) {
+          adminSet.add(String(typeof a === "object" ? (a?.uid ?? a?.id ?? "") : a));
+        }
+      }
+    }
+  } catch {
+    // raw_json 解析失败就退回无角色标注
+  }
+
+  const [memberRows] = await db.query<mysql.RowDataPacket[]>(
+    `SELECT sender_id, screen_name, avatar_url, message_count, last_seen_at
+     FROM users WHERE FIND_IN_SET(?, gids) > 0
+     ORDER BY sender_id ASC`,
+    [gid]
+  );
+
+  return {
+    info: {
+      gid: String(r.gid),
+      name: r.name ? String(r.name) : null,
+      description: r.description ? String(r.description) : null,
+      announcement: r.announcement ? String(r.announcement) : null,
+      ownerUid,
+      userCount: r.user_count != null ? Number(r.user_count) : null,
+      maxMember: r.max_member != null ? Number(r.max_member) : null,
+      avatarUrl: r.avatar_url ? String(r.avatar_url) : null,
+      groupUrl: r.group_url ? String(r.group_url) : null,
+      groupNo: r.group_no ? String(r.group_no) : null,
+      nick: r.nick ? String(r.nick) : null,
+      createTimeUnix:
+        r.create_time_unix != null ? Number(r.create_time_unix) : null,
+      memberRows: Number(r.member_rows || 0),
+      importedAt: toIsoFromMysql(r.imported_at),
+    },
+    members: memberRows.map((m) => {
+      const uid = String(m.sender_id);
+      return {
+        uid,
+        screenName: m.screen_name ? String(m.screen_name) : null,
+        avatarUrl: m.avatar_url ? String(m.avatar_url) : null,
+        role: ownerUid === uid ? 2 : adminSet.has(uid) ? 1 : null,
+        messageCount: m.message_count != null ? Number(m.message_count) : null,
+        lastSeenAt: m.last_seen_at ? toIsoFromMysql(m.last_seen_at) : null,
+      };
+    }),
+  };
+}
+
+export async function listGroups(options?: { refresh?: boolean }): Promise<ChatGroupSummary[]> {
+  const db = getPool();
+
+  // 内存缓存：大表聚合实测 3~30s（buffer pool 远小于数据量时更慢），60s 内直接复用
+  const now = Date.now();
+  if (!options?.refresh && groupsCache && now - groupsCache.at < 60_000) {
+    return groupsCache.data;
+  }
+
+  // group_info 是小表：先读进内存 map，避免和百万级消息表 JOIN
+  // （实测 LEFT JOIN group_info 让聚合从 3.5s 恶化到 30s）
+  const [giRows] = await db.query<mysql.RowDataPacket[]>(
+    `SELECT gid, name, user_count, avatar_url FROM group_info`
+  );
+  const giMap = new Map(
+    (giRows as mysql.RowDataPacket[]).map((r) => [String(r.gid), r])
+  );
+
+  // 纯聚合：只扫 chat_messages，GROUP BY group_id 可利用 (group_id, msg_time_unix) 索引
   const [rows] = await db.query<mysql.RowDataPacket[]>(
     `SELECT
        group_id,
@@ -903,34 +1340,53 @@ export async function listGroups(): Promise<ChatGroupSummary[]> {
   );
 
   const summaries: ChatGroupSummary[] = [];
-  for (const row of rows) {
+  for (const row of rows as mysql.RowDataPacket[]) {
     const groupId = String(row.group_id);
     const firstUnix = row.first_unix != null ? Number(row.first_unix) : null;
     const lastUnix = row.last_unix != null ? Number(row.last_unix) : null;
 
-    const [latestRows] = await db.query<mysql.RowDataPacket[]>(
-      `SELECT sender_name, content
-       FROM chat_messages
-       WHERE group_id = ?
-       ORDER BY msg_time_unix DESC, id DESC
-       LIMIT 1`,
-      [groupId]
-    );
-    const latest = latestRows[0];
-    const latestSender = latest?.sender_name ? String(latest.sender_name) : "群聊";
+    const gi = giMap.get(groupId);
+    const groupName = gi?.name ? String(gi.name) : null;
+
+    let latestSender = "群聊";
+    let latestContent: string | null = null;
+    if (!groupName) {
+      // 走 (group_id, msg_time_unix) 索引，单群毫秒级
+      const [latestRows] = await db.query<mysql.RowDataPacket[]>(
+        `SELECT sender_name, content
+         FROM chat_messages
+         WHERE group_id = ?
+         ORDER BY msg_time_unix DESC, id DESC
+         LIMIT 1`,
+        [groupId]
+      );
+      const latest = latestRows[0];
+      latestSender = latest?.sender_name ? String(latest.sender_name) : "群聊";
+      latestContent = latest?.content != null ? String(latest.content) : null;
+    }
 
     summaries.push({
       groupId,
-      title: `${latestSender} 的群聊`,
+      title: groupName || `${latestSender} 的群聊`,
       messageCount: Number(row.message_count || 0),
       dayCount: Number(row.day_count || 0),
       firstAt: firstUnix != null ? new Date(firstUnix * 1000).toISOString() : null,
       lastAt: lastUnix != null ? new Date(lastUnix * 1000).toISOString() : null,
-      preview: latest?.content != null ? String(latest.content).slice(0, 120) : null,
+      preview: groupName ? null : latestContent?.slice(0, 120) ?? null,
+      groupName,
+      memberCount: gi?.user_count != null ? Number(gi.user_count) : null,
+      groupAvatar: gi?.avatar_url ? String(gi.avatar_url) : null,
     });
   }
 
+  groupsCache = { data: summaries, at: now };
   return summaries;
+}
+let groupsCache: { data: ChatGroupSummary[]; at: number } | null = null;
+
+/** 群数据变动时（导入群信息、新备份入库）清空列表缓存 */
+export function invalidateGroupsCache(): void {
+  groupsCache = null;
 }
 
 export async function listGroupDays(groupId: string): Promise<ChatDayStat[]> {
@@ -1203,47 +1659,54 @@ function emptyHourStats(): Array<{ hour: string; count: number }> {
   return Array.from({ length: 24 }, (_, i) => ({ hour: `${i}:00`, count: 0 }));
 }
 
-export async function getGroupStats(groupId: string): Promise<GroupStats> {
+export async function getGroupStats(groupId: string, options?: { refresh?: boolean }): Promise<GroupStats> {
   const db = getPool();
 
-  const [[totals]] = await db.query<mysql.RowDataPacket[]>(
-    `SELECT
-       COUNT(*) AS total_messages,
-       COUNT(DISTINCT sender_name) AS sender_count,
-       COUNT(DISTINCT archive_date) AS day_count
-     FROM chat_messages
-     WHERE group_id = ?`,
-    [groupId]
-  );
+  const now = Date.now();
+  const cached = groupStatsCache.get(groupId);
+  if (!options?.refresh && cached && now - cached.at < 60_000) return cached.data;
 
-  const [bySenderRows] = await db.query<mysql.RowDataPacket[]>(
-    `SELECT COALESCE(sender_name, '未知用户') AS name, COUNT(*) AS cnt
-     FROM chat_messages
-     WHERE group_id = ?
-     GROUP BY sender_name
-     ORDER BY cnt DESC
-     LIMIT 20`,
-    [groupId]
-  );
-
-  // msg_time 已是上海墙钟，直接取 HOUR
-  const [byHourRows] = await db.query<mysql.RowDataPacket[]>(
-    `SELECT HOUR(msg_time) AS hr, COUNT(*) AS cnt
-     FROM chat_messages
-     WHERE group_id = ? AND msg_time IS NOT NULL
-     GROUP BY HOUR(msg_time)`,
-    [groupId]
-  );
-
-  const [byDayRows] = await db.query<mysql.RowDataPacket[]>(
-    `SELECT archive_date, COUNT(*) AS cnt
-     FROM chat_messages
-     WHERE group_id = ?
-     GROUP BY archive_date
-     ORDER BY archive_date DESC
-     LIMIT 90`,
-    [groupId]
-  );
+  const [totalsR, bySenderR, byHourR, byDayR] = await Promise.all([
+    db.query<mysql.RowDataPacket[]>(
+      `SELECT
+         COUNT(*) AS total_messages,
+         COUNT(DISTINCT sender_name) AS sender_count,
+         COUNT(DISTINCT archive_date) AS day_count
+       FROM chat_messages
+       WHERE group_id = ?`,
+      [groupId]
+    ),
+    db.query<mysql.RowDataPacket[]>(
+      `SELECT COALESCE(sender_name, '未知用户') AS name, COUNT(*) AS cnt
+       FROM chat_messages
+       WHERE group_id = ?
+       GROUP BY sender_name
+       ORDER BY cnt DESC
+       LIMIT 20`,
+      [groupId]
+    ),
+    // msg_time 已是上海墙钟，直接取 HOUR
+    db.query<mysql.RowDataPacket[]>(
+      `SELECT HOUR(msg_time) AS hr, COUNT(*) AS cnt
+       FROM chat_messages
+       WHERE group_id = ? AND msg_time IS NOT NULL
+       GROUP BY HOUR(msg_time)`,
+      [groupId]
+    ),
+    db.query<mysql.RowDataPacket[]>(
+      `SELECT archive_date, COUNT(*) AS cnt
+       FROM chat_messages
+       WHERE group_id = ?
+       GROUP BY archive_date
+       ORDER BY archive_date DESC
+       LIMIT 90`,
+      [groupId]
+    ),
+  ]);
+  const totals = totalsR[0][0];
+  const bySenderRows = bySenderR[0] as mysql.RowDataPacket[];
+  const byHourRows = byHourR[0] as mysql.RowDataPacket[];
+  const byDayRows = byDayR[0] as mysql.RowDataPacket[];
 
   const byHour = emptyHourStats();
   for (const row of byHourRows) {
@@ -1251,7 +1714,7 @@ export async function getGroupStats(groupId: string): Promise<GroupStats> {
     if (hr >= 0 && hr < 24) byHour[hr].count = Number(row.cnt || 0);
   }
 
-  return {
+  const result: GroupStats = {
     groupId,
     totalMessages: Number(totals?.total_messages || 0),
     senderCount: Number(totals?.sender_count || 0),
@@ -1266,33 +1729,45 @@ export async function getGroupStats(groupId: string): Promise<GroupStats> {
       count: Number(r.cnt || 0),
     })),
   };
+  groupStatsCache.set(groupId, { data: result, at: now });
+  return result;
 }
+const groupStatsCache = new Map<string, { data: GroupStats; at: number }>();
 
-export async function getOverallStats(): Promise<OverallStats> {
+export async function getOverallStats(options?: { refresh?: boolean }): Promise<OverallStats> {
   const db = getPool();
 
-  const [[totals]] = await db.query<mysql.RowDataPacket[]>(
-    `SELECT
-       COUNT(*) AS total_messages,
-       COUNT(DISTINCT group_id) AS group_count,
-       COUNT(DISTINCT sender_name) AS sender_count
-     FROM chat_messages`
-  );
+  const now = Date.now();
+  if (!options?.refresh && overallStatsCache && now - overallStatsCache.at < 60_000) {
+    return overallStatsCache.data;
+  }
 
-  const [bySenderRows] = await db.query<mysql.RowDataPacket[]>(
-    `SELECT COALESCE(sender_name, '未知用户') AS name, COUNT(*) AS cnt
-     FROM chat_messages
-     GROUP BY sender_name
-     ORDER BY cnt DESC
-     LIMIT 10`
-  );
-
-  const [byHourRows] = await db.query<mysql.RowDataPacket[]>(
-    `SELECT HOUR(msg_time) AS hr, COUNT(*) AS cnt
-     FROM chat_messages
-     WHERE msg_time IS NOT NULL
-     GROUP BY HOUR(msg_time)`
-  );
+  // 三个聚合并行跑（串行实测 ~4s，大表聚合是主要成本）
+  const [totalsR, bySenderR, byHourR] = await Promise.all([
+    db.query<mysql.RowDataPacket[]>(
+      `SELECT
+         COUNT(*) AS total_messages,
+         COUNT(DISTINCT group_id) AS group_count,
+         COUNT(DISTINCT sender_name) AS sender_count
+       FROM chat_messages`
+    ),
+    db.query<mysql.RowDataPacket[]>(
+      `SELECT COALESCE(sender_name, '未知用户') AS name, COUNT(*) AS cnt
+       FROM chat_messages
+       GROUP BY sender_name
+       ORDER BY cnt DESC
+       LIMIT 10`
+    ),
+    db.query<mysql.RowDataPacket[]>(
+      `SELECT HOUR(msg_time) AS hr, COUNT(*) AS cnt
+       FROM chat_messages
+       WHERE msg_time IS NOT NULL
+       GROUP BY HOUR(msg_time)`
+    ),
+  ]);
+  const totals = totalsR[0][0];
+  const bySenderRows = bySenderR[0] as mysql.RowDataPacket[];
+  const byHourRows = byHourR[0] as mysql.RowDataPacket[];
 
   const byHour = emptyHourStats();
   for (const row of byHourRows) {
@@ -1300,7 +1775,7 @@ export async function getOverallStats(): Promise<OverallStats> {
     if (hr >= 0 && hr < 24) byHour[hr].count = Number(row.cnt || 0);
   }
 
-  return {
+  const result: OverallStats = {
     totalMessages: Number(totals?.total_messages || 0),
     groupCount: Number(totals?.group_count || 0),
     senderCount: Number(totals?.sender_count || 0),
@@ -1310,4 +1785,7 @@ export async function getOverallStats(): Promise<OverallStats> {
     })),
     byHour,
   };
+  overallStatsCache = { data: result, at: now };
+  return result;
 }
+let overallStatsCache: { data: OverallStats; at: number } | null = null;

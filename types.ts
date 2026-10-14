@@ -57,6 +57,44 @@ export interface ChatGroupSummary {
   firstAt: string | null;
   lastAt: string | null;
   preview: string | null;
+  /** 来自 group_info 表的真实群名（导入过 query_group.json 后才有） */
+  groupName?: string | null;
+  /** 群成员数（来自 group_info 表） */
+  memberCount?: number | null;
+  groupAvatar?: string | null;
+}
+
+/** 微博群信息（query_group.json 导入） */
+export interface GroupInfoSummary {
+  gid: string;
+  name: string | null;
+  description: string | null;
+  announcement: string | null;
+  ownerUid: string | null;
+  userCount: number | null;
+  maxMember: number | null;
+  avatarUrl: string | null;
+  groupUrl: string | null;
+  groupNo: string | null;
+  nick: string | null;
+  createTimeUnix: number | null;
+  memberRows: number;
+  importedAt: string | null;
+}
+
+export interface GroupMember {
+  uid: string;
+  screenName: string | null;
+  avatarUrl: string | null;
+  level: number | null;
+  verified: boolean | null;
+  /** 2=群主 1=管理员 null=普通成员 */
+  role: number | null;
+  groupNick: string | null;
+}
+
+export interface GroupInfoDetail extends GroupInfoSummary {
+  members: GroupMember[];
 }
 
 export interface ChatDayStat {

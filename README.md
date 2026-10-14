@@ -14,7 +14,9 @@ Node.js 版本：v22.17.1
    ```bash
    npm run dev
    ```
-   应用会自动在浏览器打开 `http://localhost:5173`。
+   启动后访问 **`https://localhost:5173/`**（HTTPS，自签证书，浏览器首次访问需信任，见「常见问题」）。
+
+   > 当前推荐直接在 **Windows 本机**运行（MySQL 与服务均可本机启动）；早前的 WSL2 运行方式仍兼容——WSL 出站网络拉新浪图片 CDN 不稳时，可另开一个 Windows 终端运行 `npm run relay` 作为图片中转（服务会自动探测并接入，无需配置）。
 
 3. **使用教程**：  
 
@@ -79,12 +81,16 @@ Node.js 版本：v22.17.1
 
 > 补充：也可以在 `chrome://settings/content/localNetworkAccess` 的「允许访问本地网络中的其他设备」里添加 `api.weibo.com`（注意：书签运行在 `api.weibo.com` 页面，只添加 `weibo.com` 无效，Chrome 按精确主机名匹配）。但部分版本该设置不生效，**推荐直接用上面的 flags 方法**。
 
-### 头像本地缓存（防微博改规则）
+### 头像与图片代理（防盗链）
 
-用户头像会自动落盘到项目根目录 `avatar-cache/`（按 URL 哈希命名）。加载优先级：**本地缓存 → 在线拉取（成功即落盘）→ 历史本地缓存 → 显示用户名首字**。即使以后微博封了外链或代理失效，已缓存过的头像仍能正常显示。
+新浪图片 CDN（`*.sinaimg.cn`）有防盗链，浏览器从 localhost 直链会 403。前端统一走 `/api/img-proxy` 服务端代理；用户头像会自动落盘到项目根目录 `avatar-cache/`（按 URL 哈希命名）。加载优先级：**本地缓存 → 在线拉取（成功即落盘）→ 历史本地缓存 → 显示用户名首字**。即使以后微博封了外链或代理失效，已缓存过的头像仍能正常显示。
 
 - 服务每次启动 3 秒后会自动预取 users 表所有头像到本地（并发 3，不阻塞服务，控制台会打印 `avatar prefetch done`）
 - 手动全量预取/刷新：浏览器访问 `https://localhost:5173/api/avatars/prefetch`（加 `?force=1` 强制全部重新下载），返回 `{total, downloaded, cached, failed}` 统计
+
+### 短链动图（media_type=9）本地化
+
+消息里的 `http://t.cn/xxx` 短链动图（如表情商店的 GIF）由 `/api/weibo-compic` 处理：从链接提取 pic_id 直拼 `wx1/wx2/wx4.sinaimg.cn` 直链（带 `Referer: https://weibo.com`），失败再回退解析 photo.weibo.com H5 页；拉取成功即落盘 `gif-cache/`（按 pic_id 命名，永久本地化），之后断网也能显示。加载失败时前端会降级为内嵌微博原页面的 iframe 兜底显示。
 
 ### 表情包本地化（防微博改规则 / 断网也能显示）
 
@@ -105,3 +111,24 @@ Node.js 版本：v22.17.1
   脚本会从上述来源合并「表情名 → 图片地址」映射、只下载数据库实际用到与面板包含的子集（sha1 命名、幂等跳过已存在）、刷新 `manifest.json`，并打印覆盖率和缺失清单（`missing-phrases.json`）。
 - 说明：`emoji-assets/` 属可再生成的派生数据，已在 `.gitignore` 中忽略；若该目录缺失，服务端会打印 `[emoji] 未找到 manifest.json` 并优雅跳过，前端自动回退为纯文本显示。
 - 界面验证：打开任意群聊，`[doge]` 等应以 1.3em 的行内小图标呈现（与普通文字同高），而不是显示 `[doge]` 四个字。
+
+### 群信息表（query_group.json 导入）
+
+除消息外，还可把微博 webim 的 `query_group.json` 群资料入库（真实群名、简介、群公告、群主/管理员、成员数、群头像等）：
+
+1. 在微博群聊页面 F12 → Network → 找到 `query_group.json`（带 `query_member=1` 的那条）→ 复制完整响应 JSON
+2. 打开「历史备份」页 → 点 **导入群信息** → 粘贴 JSON → 导入
+
+- 数据落库：`group_info` 表（含原始 JSON 全文，字段解析不到也不会丢数据）；成员资料 upsert 进 `users` 表并通过 `gids` 字段（逗号分隔，可多群）记录归属
+- 导入后「历史备份」页的群卡片会显示**真实群名、群头像、成员数量**（并带「已导入群信息」徽标），替代原来的「XX 的群聊」临时名
+- 群主/管理员角色（2=群主、1=管理员）在查询详情时从原始 JSON 动态解析，不单独存列
+
+### 图片预览器（微博查看器样式）
+
+点击聊天中的图片打开大图预览，支持：鼠标左键按住拖动平移、滚轮以光标为中心缩放（0.2x~8x）、双击在适合窗口与 2.5x 间切换、底部工具栏（缩小/百分比复位/放大/下载/关闭）。点击图片外的区域或按 `Esc` 关闭；拖动松手不会误触发关闭。
+
+### 性能与缓存说明
+
+- `/api/groups`、`/api/stats`、`/api/groups/:id/stats` 有 60 秒服务端内存缓存，「历史备份」页的**刷新元数据**按钮会带 `refresh=1` 强制重查
+- MySQL 建议 `innodb_buffer_pool_size` ≥ 512M（数据约 1.3GB，默认 128M 会明显拖慢全表聚合）；如在线调过（`SET GLOBAL innodb_buffer_pool_size=536870912`），重启后需写入 `my.cnf` 持久化
+- `avatar-cache/`、`gif-cache/`、`emoji-assets/`、`backups/` 均为可再生成的派生数据，已在 `.gitignore` 中忽略；删除后可按上文方法重建（缓存目录无需重建，会按需自动填充）

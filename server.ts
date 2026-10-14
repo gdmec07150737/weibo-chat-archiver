@@ -1,16 +1,20 @@
 import {
   ensureSchema,
+  getGroupInfoDetail,
   getGroupProgress,
   getGroupStats,
   getOverallStats,
+  invalidateGroupsCache,
   listAllAvatarUrls,
   listArchives,
   listGroupDays,
+  listGroupInfos,
   listGroupUsers,
   listGroups,
   listMessagesByGroup,
   queryMessagesPage,
   searchMessages,
+  upsertGroupInfoImport,
   upsertMessages,
   upsertUsersFromMessages,
   fillUserAvatarFromMessages,
@@ -499,6 +503,7 @@ async function startServer() {
       });
 
       const result = await upsertMessages(String(groupId), normalized);
+      invalidateGroupsCache();
 
       console.log(
         `MySQL messages upserted: affected=${result.affected}, days=${result.files.join(", ") || "(none)"}`
@@ -514,10 +519,47 @@ async function startServer() {
     }
   });
 
-  // —— 百万级阅读：元数据 / 分页 / 搜索 / 统计 ——
-  app.get("/api/groups", async (_req, res) => {
+  // —— 微博群信息（query_group.json 导入）——
+  app.post("/api/group-info/import", async (req, res) => {
     try {
-      const groups = await listGroups();
+      const result = await upsertGroupInfoImport(req.body);
+      invalidateGroupsCache();
+      console.log(
+        `[group-info] 导入完成: 群 ${result.groups} 个（${result.gids.join(", ")}），成员 ${result.members} 条`
+      );
+      res.json({ success: true, ...result });
+    } catch (error: any) {
+      console.error("Failed to import group info:", error);
+      res.status(400).json({ error: error?.message || "导入群信息失败" });
+    }
+  });
+
+  app.get("/api/group-info", async (_req, res) => {
+    try {
+      const infos = await listGroupInfos();
+      res.json({ groups: infos });
+    } catch (error) {
+      console.error("Failed to list group info:", error);
+      res.status(500).json({ error: "Failed to list group info" });
+    }
+  });
+
+  app.get("/api/group-info/:gid", async (req, res) => {
+    try {
+      const detail = await getGroupInfoDetail(String(req.params.gid || ""));
+      if (!detail) return res.status(404).json({ error: "Group not found" });
+      res.json(detail);
+    } catch (error) {
+      console.error("Failed to get group info:", error);
+      res.status(500).json({ error: "Failed to get group info" });
+    }
+  });
+
+  // —— 百万级阅读：元数据 / 分页 / 搜索 / 统计 ——
+  app.get("/api/groups", async (req, res) => {
+    try {
+      const refresh = req.query.refresh === "1";
+      const groups = await listGroups({ refresh });
       res.json({ groups });
     } catch (error) {
       console.error("Failed to list groups:", error);
@@ -630,7 +672,7 @@ async function startServer() {
     try {
       const groupId = String(req.params.groupId || "");
       if (!groupId) return res.status(400).json({ error: "Missing groupId" });
-      const stats = await getGroupStats(groupId);
+      const stats = await getGroupStats(groupId, { refresh: req.query.refresh === "1" });
       res.json(stats);
     } catch (error) {
       console.error("Failed to load group stats:", error);
@@ -638,9 +680,10 @@ async function startServer() {
     }
   });
 
-  app.get("/api/stats", async (_req, res) => {
+  app.get("/api/stats", async (req, res) => {
     try {
-      const stats = await getOverallStats();
+      const refresh = req.query.refresh === "1";
+      const stats = await getOverallStats({ refresh });
       res.json(stats);
     } catch (error) {
       console.error("Failed to load overall stats:", error);
@@ -695,31 +738,50 @@ async function startServer() {
     }
   });
 
+  const httpsOptions = {
+    key: fsSync.readFileSync(path.join(process.cwd(), "localhost+2-key.pem")),
+    cert: fsSync.readFileSync(path.join(process.cwd(), "localhost+2.pem")),
+  };
+
+  let httpServer: https.Server;
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
       server: {
         middlewareMode: true,
         hmr: {
           host: "localhost",
+          // 页面走 HTTPS，客户端必须用 wss 连 HMR，否则浏览器拒绝明文 ws
+          protocol: "wss",
         },
       },
       appType: "spa",
     });
     app.use(vite.middlewares);
+
+    // middlewareMode 下 vite 不会自动处理 HTTP server 的 upgrade 事件，
+    // 需要把 vite-hmr 的 WebSocket 升级请求转给它，否则控制台报
+    // "Upgrade attempt for WebSocket closed without opened connection"
+    httpServer = https.createServer(httpsOptions, app);
+    httpServer.on("upgrade", (req, socket, head) => {
+      const viteWs = (vite as unknown as {
+        ws?: { handleUpgrade: (req: unknown, sock: unknown, head: unknown, cb: (ws: unknown) => void) => void; emit: (ev: string, ...args: unknown[]) => void };
+      }).ws;
+      if (viteWs && req.headers["sec-websocket-protocol"] === "vite-hmr") {
+        viteWs.handleUpgrade(req, socket, head, (ws) => {
+          viteWs.emit("connection", ws, req);
+        });
+      }
+    });
   } else {
     const distPath = path.join(process.cwd(), "dist");
     app.use(express.static(distPath));
     app.get("*all", (req, res) => {
       res.sendFile(path.join(distPath, "index.html"));
     });
+    httpServer = https.createServer(httpsOptions, app);
   }
 
-  const httpsOptions = {
-    key: fsSync.readFileSync(path.join(process.cwd(), "localhost+2-key.pem")),
-    cert: fsSync.readFileSync(path.join(process.cwd(), "localhost+2.pem")),
-  };
-
-  https.createServer(httpsOptions, app).listen(PORT, "0.0.0.0", () => {
+  httpServer.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on https://localhost:${PORT}`);
 
     // 启动后异步预取所有用户头像到本地缓存（不阻塞服务；失败仅告警）

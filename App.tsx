@@ -23,12 +23,12 @@ const App: React.FC = () => {
   const [loadingGroups, setLoadingGroups] = useState(false);
   const [totalMessages, setTotalMessages] = useState(0);
 
-  const refreshGroups = useCallback(async (silent = false) => {
+  const refreshGroups = useCallback(async (silent = false, force = false) => {
     if (!silent) setLoadingGroups(true);
     try {
       const [list, stats] = await Promise.all([
-        fetchGroups(),
-        fetchOverallStats().catch(() => null),
+        fetchGroups(force),
+        fetchOverallStats(force).catch(() => null),
       ]);
       setGroups(list);
       if (stats) setTotalMessages(stats.totalMessages);
@@ -95,7 +95,7 @@ const App: React.FC = () => {
             <ChatHistory
               groups={groups}
               loading={loadingGroups}
-              onRefresh={() => void refreshGroups()}
+              onRefresh={() => void refreshGroups(false, true)}
               onOpenGroup={setSelectedGroup}
             />
           </div>
