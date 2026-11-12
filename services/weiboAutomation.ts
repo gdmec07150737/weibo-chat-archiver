@@ -6,8 +6,46 @@ export const generateCollectorScript = (groupId: string = '', appUrl: string = '
   return `
 (async function() {
   console.log("%c微博聊天记录自动化采集器启动...", "color: #6366f1; font-weight: bold; font-size: 14px;");
-  
+
+  // ============ 跨午夜自动续采 ============
+  // 微博聊天前端每约 24 小时会自动 reload 页面（report.json 的 duration≈86400 即会话计时到点），
+  // 页面一刷新注入的脚本就没了。对策：① 拦截 location.reload（尽力而为）；
+  // ② 把采集配置写进 localStorage，配合油猴脚本在页面加载后自动续采（治本）。
+  const LS_KEY = "wb_collector_session";
+  const readSavedCfg = () => {
+    try {
+      const v = JSON.parse(localStorage.getItem(LS_KEY) || "null");
+      return v && v.groupId ? v : null;
+    } catch (e) { return null; }
+  };
+  // 油猴脚本会把 window.__WB_COLLECTOR_RESUME__ 设为 true（免弹窗静默续采）
+  const savedCfg = window.__WB_COLLECTOR_RESUME__ === true ? readSavedCfg() : null;
+  // 书签手动点击时：若有上次会话，问一次是否沿用（省去连答三个 prompt）
+  if (!savedCfg) {
+    const last = readSavedCfg();
+    if (last && confirm(
+      "检测到上次采集会话：\\n群 " + last.groupId + " · " + (last.mode === 1 ? "历史" : "监控") + "模式 · " + (last.interval / 1000) + " 秒间隔\\n\\n是否直接按上次配置继续采集？\\n（取消则按正常流程询问）"
+    )) {
+      window.__WB_COLLECTOR_RESUME__ = true;
+    }
+  }
+  const cfg = window.__WB_COLLECTOR_RESUME__ === true ? readSavedCfg() : null;
+  if (window.__WB_COLLECTOR_RESUME__ === true && !cfg) {
+    console.warn("[采集器] 续采模式但没有可用会话，转为手动流程");
+  }
+  // 尽力拦截页面自动 reload（微博 24h 会话刷新）；手动 Ctrl+R 走浏览器导航不受影响
+  try {
+    const _origReload = Location.prototype.reload;
+    Location.prototype.reload = function () {
+      console.warn("[采集器] 已拦截页面自动 reload（微博约每 24h 刷新会话）。采集继续运行。");
+      return undefined;
+    };
+  } catch (blockErr) {
+    console.warn("[采集器] 无法拦截 reload（将依赖油猴脚本自动续采）:", blockErr);
+  }
+
   const getGroupId = () => {
+    if (cfg) return cfg.groupId;
     if ("${groupId}") return "${groupId}";
     const hash = window.location.hash;
     const hashParams = new URLSearchParams(hash.split('?')[1] || "");
@@ -41,13 +79,18 @@ export const generateCollectorScript = (groupId: string = '', appUrl: string = '
     return;
   }
 
-  const mode = prompt("请选择采集模式：\\n1. 备份历史消息 (向上翻页)\\n2. 监控当前消息 (保持最新，可补跨日漏抓)", "2");
+  const mode = cfg ? String(cfg.mode) : prompt("请选择采集模式：\\n1. 备份历史消息 (向上翻页)\\n2. 监控当前消息 (保持最新，可补跨日漏抓)", "2");
   const isHistoryMode = mode === "1";
-  
+
   const defaultInterval = isHistoryMode ? "2" : "20";
-  const intervalInput = prompt(\`请输入抓取间隔（秒，最小值 1）：\`, defaultInterval);
+  const intervalInput = cfg ? String(cfg.interval / 1000) : prompt(\`请输入抓取间隔（秒，最小值 1）：\`, defaultInterval);
   let interval = parseInt(intervalInput || defaultInterval) * 1000;
   if (isNaN(interval) || interval < 1000) interval = 1000;
+
+  // 记录采集会话：页面被微博刷新后，油猴脚本凭它自动续采；手动「停止采集」会清除
+  try {
+    localStorage.setItem(LS_KEY, JSON.stringify({ groupId, mode: isHistoryMode ? 1 : 2, interval, appUrl }));
+  } catch (lsErr) { /* localStorage 不可用时仅失去自动续采能力 */ }
 
   // 创建控制面板
   const controlDiv = document.createElement('div');
@@ -58,7 +101,8 @@ export const generateCollectorScript = (groupId: string = '', appUrl: string = '
       <div style="width:10px;height:10px;background:#6366f1;border-radius:50%;animation:pulse 2s infinite;"></div>
       微博采集控制台
     </div>
-    <div style="font-size:12px;margin-bottom:8px;opacity:0.8;">模式: \${isHistoryMode ? "历史备份（逐页入库）" : "实时监控（逐页入库）"}</div>
+    <div style="font-size:12px;margin-bottom:8px;opacity:0.8;">模式: \${isHistoryMode ? "历史备份（逐页入库）" : "实时监控（逐页入库）"}\${cfg ? " · 自动续采" : ""}</div>
+    <div style="font-size:11px;margin-bottom:8px;opacity:0.55;">自动续采已开启：页面被刷新后会自动恢复采集</div>
     <div id="wb-status" style="font-size:14px;margin-bottom:8px;color:#818cf8;">正在初始化...</div>
     <div id="wb-count" style="font-size:22px;font-weight:bold;margin-bottom:4px;text-align:center;">0 <span style="font-size:12px;font-weight:normal;opacity:0.6;">已入库</span></div>
     <div id="wb-pending" style="font-size:12px;text-align:center;margin-bottom:16px;opacity:0.7;">待重试 0 条</div>
@@ -72,8 +116,9 @@ export const generateCollectorScript = (groupId: string = '', appUrl: string = '
   document.body.appendChild(controlDiv);
 
   let running = true;
-  document.getElementById('wb-stop').onclick = () => { 
-    running = false; 
+  document.getElementById('wb-stop').onclick = () => {
+    running = false;
+    try { localStorage.removeItem(LS_KEY); } catch (e) {} // 手动停止 = 不再自动续采
     document.getElementById('wb-status').innerText = "正在停止...";
     document.getElementById('wb-stop').disabled = true;
     document.getElementById('wb-stop').style.opacity = "0.5";
@@ -263,7 +308,7 @@ export const generateCollectorScript = (groupId: string = '', appUrl: string = '
         dbNewestMid = String(progress.newestMessageId);
       }
       if (isHistoryMode && progress.count > 0 && progress.oldestMessageId) {
-        const resume = confirm(
+        const resume = cfg ? true : confirm(
           \`检测到该群在 MySQL 已有 \${progress.count} 条消息。\\n\\n是否从最旧消息继续往更早抓取（断点续采）？\\n\\n点击「确定」续采；「取消」则从最新往旧翻。\\n\\n注意：历史模式只往更早抓，跨日后的新消息请用「监控模式」。\`
         );
         if (resume) {
@@ -463,6 +508,11 @@ export const generateCollectorScript = (groupId: string = '', appUrl: string = '
       await sleep(interval);
     }
 
+    // 历史模式跑完 = 任务彻底结束，清除续采会话；监控模式保留（掉线/刷新后油猴脚本自动续）
+    if (isHistoryMode) {
+      try { localStorage.removeItem(LS_KEY); } catch (e) {}
+    }
+
     // 停止/结束后：重试待入库消息
     if (pendingMessages.length > 0) {
       updateUI(\`正在重试入库 \${pendingMessages.length} 条...\`);
@@ -520,5 +570,52 @@ export const generateCollectorScript = (groupId: string = '', appUrl: string = '
   }
 })();
   `.trim();
+};
+
+/**
+ * 生成油猴（Tampermonkey）脚本：微博聊天页每次加载后自动恢复未结束的采集会话。
+ * 背景：微博聊天前端每约 24 小时会自动 reload 页面（webim/report.json 的 duration≈86400
+ * 即会话计时到点），书签注入的采集器随页面销毁，采集中断。
+ * 采集器运行时会把配置写入该页面 localStorage（wb_collector_session），
+ * 本脚本在页面加载完成后检测到未结束的会话就免弹窗自动续采。
+ */
+export const generateUserscript = (appUrl: string = '') => {
+  const body = generateCollectorScript('', appUrl);
+  return `// ==UserScript==
+// @name         微博群聊采集·自动续采 (weibo-chat-archiver)
+// @namespace    weibo-chat-archiver
+// @version      1.1
+// @description  微博聊天页每次加载后，若存在未结束的采集会话则自动恢复采集（配合本地归档服务）
+// @match        https://api.weibo.com/chat*
+// @run-at       document-idle
+// @grant        none
+// ==/UserScript==
+
+(function () {
+  'use strict';
+  const tryStart = () => {
+    try {
+      let session = null;
+      try { session = JSON.parse(localStorage.getItem("wb_collector_session") || "null"); } catch (e) {}
+      if (!session || !session.groupId) {
+        console.info("[自动续采] 本页没有未结束的采集会话（wb_collector_session 为空）。首次使用请先用归档应用里的书签开始一次采集；停止采集后此记录会被清除。");
+        return;
+      }
+      if (document.getElementById("wb-collector-panel")) return; // 已在采集中
+      console.log("[自动续采] 检测到未结束的采集会话（群 " + session.groupId + "），自动恢复采集...");
+      window.__WB_COLLECTOR_RESUME__ = true;
+      ${body}
+    } catch (err) {
+      console.warn("[自动续采] 启动失败:", err);
+    }
+  };
+  // 等页面就绪后稍等几秒，让微博聊天应用先完成初始化
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", () => setTimeout(tryStart, 3000));
+  } else {
+    setTimeout(tryStart, 3000);
+  }
+})();
+`.trim();
 };
 

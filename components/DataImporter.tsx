@@ -1,6 +1,6 @@
 import React, { useState } from "react";
 import { parseRawChatData } from "../services/gemini";
-import { generateCollectorScript } from "../services/weiboAutomation";
+import { generateCollectorScript, generateUserscript } from "../services/weiboAutomation";
 import { uploadBackup } from "../services/archiveApi";
 import {
   Copy,
@@ -28,6 +28,7 @@ const DataImporter: React.FC<DataImporterProps> = ({
   const [isProcessing, setIsProcessing] = useState(false);
   const [isSyncing, setIsSyncing] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [userscriptCopied, setUserscriptCopied] = useState(false);
 
   const getAppUrl = () => {
     let origin = window.location.origin;
@@ -41,6 +42,13 @@ const DataImporter: React.FC<DataImporterProps> = ({
   const appUrl = getAppUrl();
   const automationScript = generateCollectorScript("", appUrl);
   const bookmarklet = `javascript:${encodeURIComponent(automationScript)}`;
+  const userscript = React.useMemo(() => generateUserscript(appUrl), [appUrl]);
+
+  const handleCopyUserscript = () => {
+    navigator.clipboard.writeText(userscript);
+    setUserscriptCopied(true);
+    setTimeout(() => setUserscriptCopied(false), 2000);
+  };
 
   const bookmarkContainerRef = React.useRef<HTMLDivElement>(null);
 
@@ -175,6 +183,30 @@ const DataImporter: React.FC<DataImporterProps> = ({
                   <RefreshCw className="w-4 h-4" />
                 )}
                 刷新群列表元数据
+              </button>
+            </div>
+
+            <div className="mt-6 bg-amber-400/10 border border-amber-400/30 rounded-2xl p-5">
+              <div className="font-bold text-amber-200 text-sm mb-2 flex items-center gap-2">
+                <ShieldCheck className="w-4 h-4" />
+                跨午夜长时间采集（推荐安装）
+              </div>
+              <p className="text-xs text-indigo-200/70 leading-relaxed mb-3">
+                微博聊天页每约 24 小时会自动刷新一次页面（接口 report.json 的 duration≈86400 即会话到点），
+                刷新后书签注入的采集器会随页面销毁。采集器已把配置存入页面 localStorage 并拦截自动刷新；
+                再安装下面的油猴脚本后，即使页面被刷新也会<strong className="text-amber-200">自动免弹窗续采</strong>，
+                挂机跨天无需人工干预。安装方式：浏览器装 Tampermonkey 扩展 → 新建脚本 → 粘贴保存即可。
+              </p>
+              <button
+                onClick={handleCopyUserscript}
+                className="px-4 py-2 bg-amber-400/20 border border-amber-400/40 text-amber-100 rounded-lg text-xs font-bold hover:bg-amber-400/30 transition-all flex items-center gap-2"
+              >
+                {userscriptCopied ? (
+                  <Check className="w-3.5 h-3.5 text-emerald-400" />
+                ) : (
+                  <Copy className="w-3.5 h-3.5" />
+                )}
+                {userscriptCopied ? "已复制油猴脚本" : "复制油猴脚本（自动续采）"}
               </button>
             </div>
           </div>
