@@ -70,6 +70,7 @@ export async function fetchMessages(params: {
   direction?: "older" | "newer";
   date?: string | null;
   aroundId?: string | null;
+  afterId?: string | null;
 }): Promise<MessagePage> {
   const qs = new URLSearchParams();
   if (params.limit) qs.set("limit", String(params.limit));
@@ -77,6 +78,7 @@ export async function fetchMessages(params: {
   if (params.direction) qs.set("direction", params.direction);
   if (params.date) qs.set("date", params.date);
   if (params.aroundId) qs.set("aroundId", params.aroundId);
+  if (params.afterId) qs.set("afterId", params.afterId);
   const q = qs.toString();
   return getJson<MessagePage>(
     `/api/groups/${encodeURIComponent(params.groupId)}/messages${q ? `?${q}` : ""}`
@@ -88,6 +90,7 @@ export async function searchGroupMessages(params: {
   q?: string;
   sender?: string;
   senderId?: string;
+  match?: "prefix" | "contains" | "exact";
   cursor?: string | null;
   limit?: number;
 }): Promise<SearchPage> {
@@ -95,6 +98,7 @@ export async function searchGroupMessages(params: {
   if (params.q) qs.set("q", params.q);
   if (params.sender) qs.set("sender", params.sender);
   if (params.senderId) qs.set("senderId", params.senderId);
+  if (params.match) qs.set("match", params.match);
   if (params.cursor) qs.set("cursor", params.cursor);
   if (params.limit) qs.set("limit", String(params.limit));
   return getJson<SearchPage>(

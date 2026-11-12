@@ -591,6 +591,8 @@ async function startServer() {
       const date = typeof req.query.date === "string" ? req.query.date : null;
       const aroundId =
         typeof req.query.aroundId === "string" ? req.query.aroundId : null;
+      const afterId =
+        typeof req.query.afterId === "string" ? req.query.afterId : null;
 
       const page = await queryMessagesPage({
         groupId,
@@ -599,6 +601,7 @@ async function startServer() {
         direction,
         date,
         aroundId,
+        afterId,
       });
       res.json(page);
     } catch (error) {
@@ -618,12 +621,18 @@ async function startServer() {
         typeof req.query.senderId === "string" ? req.query.senderId : "";
       const cursor = typeof req.query.cursor === "string" ? req.query.cursor : null;
       const limit = Number(req.query.limit || 30);
+      const rawMatch = typeof req.query.match === "string" ? req.query.match : "";
+      const match =
+        rawMatch === "contains" || rawMatch === "exact"
+          ? (rawMatch as "contains" | "exact")
+          : ("prefix" as const);
 
       const page = await searchMessages({
         groupId,
         q,
         sender,
         senderId,
+        match,
         cursor,
         limit,
       });

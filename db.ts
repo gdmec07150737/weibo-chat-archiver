@@ -224,6 +224,14 @@ export async function ensureSchema(): Promise<void> {
   } catch {
     // already exists
   }
+  // 搜索加速：LIKE '关键词%' 可走 (group_id, content 前缀) 联合索引做范围扫描
+  try {
+    await db.query(
+      `ALTER TABLE chat_messages ADD KEY idx_group_content (group_id, content(64))`
+    );
+  } catch {
+    // already exists
+  }
   await repairMsgTimeTimezone(db);
   await backfillUsersFromMessages(db);
 }
@@ -1412,6 +1420,8 @@ export type QueryMessagesOptions = {
   direction?: "older" | "newer";
   date?: string | null;
   aroundId?: string | null;
+  /** 刷新用：取该条消息（message_id）之后入库的新消息 */
+  afterId?: string | null;
 };
 
 export async function queryMessagesPage(
@@ -1504,6 +1514,35 @@ export async function queryMessagesPage(
       hasMoreOlder: checkOlder.length > 0,
       hasMoreNewer: checkNewer.length > 0,
     });
+  }
+
+  // 刷新：取某条消息之后入库的新消息（前端「刷新」按钮用）
+  if (options.afterId && !options.cursor) {
+    const [anchorRows] = await db.query<mysql.RowDataPacket[]>(
+      `SELECT id, msg_time_unix FROM chat_messages
+       WHERE group_id = ? AND message_id = ?
+       LIMIT 1`,
+      [groupId, options.afterId]
+    );
+    if (anchorRows.length > 0) {
+      const anchor = anchorRows[0];
+      const [rowsAsc] = await db.query<mysql.RowDataPacket[]>(
+        `SELECT id, message_id, archive_date, msg_time, msg_time_unix, sender_id, sender_name, content, raw_json
+         FROM chat_messages
+         WHERE group_id = ?
+           AND (msg_time_unix > ? OR (msg_time_unix = ? AND id > ?))
+         ORDER BY msg_time_unix ASC, id ASC
+         LIMIT ?`,
+        [groupId, anchor.msg_time_unix, anchor.msg_time_unix, anchor.id, limit + 1]
+      );
+      const hasMoreNewer = rowsAsc.length > limit;
+      const pageRows = hasMoreNewer ? rowsAsc.slice(0, limit) : rowsAsc;
+      return finalize(pageRows, {
+        hasMoreOlder: true,
+        hasMoreNewer,
+      });
+    }
+    // 锚点消息不存在（如清库重建）→ 落到下面的默认逻辑，返回最新一页
   }
 
   // 跳转到某日：从该日最早消息起向新方向取一页
@@ -1599,6 +1638,8 @@ export async function searchMessages(options: {
   q?: string;
   sender?: string;
   senderId?: string;
+  /** 关键词匹配方式：prefix=LIKE 'q%'（默认，走索引） / contains=LIKE '%q%' / exact=content = q */
+  match?: "prefix" | "contains" | "exact";
   cursor?: string | null;
   limit?: number;
 }): Promise<SearchPage> {
@@ -1608,14 +1649,25 @@ export async function searchMessages(options: {
   const q = (options.q || "").trim();
   const sender = (options.sender || "").trim();
   const senderId = (options.senderId || "").trim();
+  const match =
+    options.match === "contains" || options.match === "exact"
+      ? options.match
+      : "prefix";
   const cursor = decodeCursor(options.cursor);
 
   const where: string[] = ["group_id = ?"];
   const params: any[] = [groupId];
 
   if (q) {
-    where.push("content LIKE ?");
-    params.push(`%${q}%`);
+    if (match === "exact") {
+      where.push("content = ?");
+      params.push(q);
+    } else {
+      // 转义 LIKE 通配符，避免用户输入 % _ 被当成通配符
+      const escaped = q.replace(/[\\%_]/g, (m) => "\\" + m);
+      where.push("content LIKE ?");
+      params.push(match === "contains" ? `%${escaped}%` : `${escaped}%`);
+    }
   }
   if (senderId) {
     where.push("sender_id = ?");

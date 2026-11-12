@@ -11,6 +11,7 @@ import {
   Loader2,
   ChevronUp,
   ChevronDown,
+  RefreshCw,
   FileText,
   Mic,
   Film,
@@ -937,6 +938,7 @@ const ChatViewer: React.FC<ChatViewerProps> = ({ group, onBack }) => {
   const [loading, setLoading] = useState(true);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [loadingNewer, setLoadingNewer] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const [days, setDays] = useState<ChatDayStat[]>([]);
@@ -944,6 +946,9 @@ const ChatViewer: React.FC<ChatViewerProps> = ({ group, onBack }) => {
   const [jumpDate, setJumpDate] = useState("");
 
   const [searchInput, setSearchInput] = useState("");
+  const [searchMode, setSearchMode] = useState<"prefix" | "contains" | "exact">(
+    "prefix"
+  );
   const [searchResults, setSearchResults] = useState<WeiboMessage[]>([]);
   const [searchCursor, setSearchCursor] = useState<string | null>(null);
   const [searchHasMore, setSearchHasMore] = useState(false);
@@ -1115,6 +1120,42 @@ const ChatViewer: React.FC<ChatViewerProps> = ({ group, onBack }) => {
     }
   }, [hasMoreNewer, nextCursor, group.groupId, applyPage]);
 
+  // 手动刷新：拉取当前窗口最新一条消息之后新入库的消息（不重置整个窗口）
+  const refreshNewer = useCallback(async () => {
+    if (loadingLock.current) return;
+    loadingLock.current = true;
+    setRefreshing(true);
+    const el = parentRef.current;
+    const nearBottom = el
+      ? el.scrollHeight - el.scrollTop - el.clientHeight < 160
+      : false;
+    const lastId = messages.length > 0 ? messages[messages.length - 1].id : null;
+    try {
+      if (!lastId) {
+        await loadInitial();
+        return;
+      }
+      const page = await fetchMessages({
+        groupId: group.groupId,
+        limit: PAGE_SIZE,
+        afterId: lastId,
+      });
+      if (page.items.length > 0) {
+        applyPage(page, "append");
+        if (nearBottom) {
+          requestAnimationFrame(() => {
+            if (el) el.scrollTop = el.scrollHeight;
+          });
+        }
+      }
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setRefreshing(false);
+      loadingLock.current = false;
+    }
+  }, [messages, group.groupId, applyPage, loadInitial]);
+
   const onScroll = () => {
     const el = parentRef.current;
     if (!el || loadingLock.current) return;
@@ -1158,6 +1199,7 @@ const ChatViewer: React.FC<ChatViewerProps> = ({ group, onBack }) => {
         groupId: group.groupId,
         q: q || undefined,
         senderId: activeSenderId || undefined,
+        match: q ? searchMode : undefined,
         cursor: reset ? null : searchCursor,
         limit: 30,
       });
@@ -1335,6 +1377,18 @@ const ChatViewer: React.FC<ChatViewerProps> = ({ group, onBack }) => {
               className="w-full pl-10 pr-4 py-2 bg-gray-50 border border-gray-200 rounded-xl focus:ring-2 focus:ring-indigo-100 focus:border-indigo-400 transition-all text-sm"
             />
           </div>
+          <select
+            value={searchMode}
+            onChange={(e) =>
+              setSearchMode(e.target.value as "prefix" | "contains" | "exact")
+            }
+            title="匹配方式：开头匹配 = LIKE '关键词%'（默认，最快）；包含内容 = LIKE '%关键词%'；完全相同 = 精确等于"
+            className="px-2 py-2 bg-white border border-gray-200 rounded-xl text-sm font-semibold text-gray-700 focus:ring-2 focus:ring-indigo-100 focus:border-indigo-400 transition-all"
+          >
+            <option value="prefix">开头匹配</option>
+            <option value="contains">包含内容</option>
+            <option value="exact">完全相同</option>
+          </select>
           <button
             onClick={() => void runSearch(true)}
             disabled={searching || (!searchInput.trim() && !activeSenderId)}
@@ -1358,6 +1412,15 @@ const ChatViewer: React.FC<ChatViewerProps> = ({ group, onBack }) => {
           >
             <Calendar className="w-4 h-4" />
             按日跳转
+          </button>
+          <button
+            onClick={() => void refreshNewer()}
+            disabled={refreshing}
+            title="拉取最新入库的消息（不用返回历史备份页重新进群）"
+            className="px-3 py-2 bg-white border border-gray-200 rounded-xl text-sm font-semibold text-gray-700 flex items-center gap-1 hover:border-indigo-300 hover:text-indigo-600 disabled:opacity-50"
+          >
+            <RefreshCw className={`w-4 h-4 ${refreshing ? "animate-spin" : ""}`} />
+            刷新
           </button>
         </div>
       </div>
@@ -1504,7 +1567,17 @@ const ChatViewer: React.FC<ChatViewerProps> = ({ group, onBack }) => {
           title={
             activeSenderName
               ? `按用户结果：${activeSenderName}`
-              : `搜索结果${searchResults.length > 0 ? ` (${searchResults.length}+)` : ""}`
+              : `搜索结果${searchResults.length > 0 ? ` (${searchResults.length}+)` : ""}${
+                  searchInput.trim() && !activeSenderId
+                    ? ` · ${
+                        searchMode === "exact"
+                          ? "完全相同"
+                          : searchMode === "contains"
+                            ? "包含内容"
+                            : "开头匹配"
+                      }`
+                    : ""
+                }`
           }
           onClose={() => setShowSearchPanel(false)}
           initialWidth={460}
